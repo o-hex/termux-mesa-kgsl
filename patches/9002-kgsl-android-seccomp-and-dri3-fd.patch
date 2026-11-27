@@ -1,0 +1,45 @@
+diff --git a/src/util/os_file.c b/src/util/os_file.c
+--- a/src/util/os_file.c
++++ b/src/util/os_file.c
+@@ -11,6 +11,9 @@
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
++#if defined(__TERMUX__) || defined(__ANDROID__)
++#include <sys/epoll.h>
++#endif
+ 
+ #if DETECT_OS_WINDOWS
+ #include <direct.h>
+@@ -232,6 +235,10 @@ typedef void *kvaddr_t;
+ 
+ #endif /* DETECT_OS_DRAGONFLY || DETECT_OS_FREEBSD */
+ 
++#if defined(__TERMUX__) || defined(__ANDROID__)
++#undef SYS_kcmp
++#endif
++
+ int
+ os_same_file_description(int fd1, int fd2)
+ {
+diff --git a/src/loader/loader.c b/src/loader/loader.c
+--- a/src/loader/loader.c
++++ b/src/loader/loader.c
+@@ -653,11 +653,16 @@ bool loader_get_user_preferred_fd(int *fd_render_gpu, int *original_fd)
+    drmDevicePtr render_dev, preferred_dev;
+    bool debug = debug_get_bool_option("DRI_PRIME_DEBUG", false);
+ 
+-   if (drmGetDevice2(*fd_render_gpu, 0, &render_dev) != 0)
++   if (drmGetDevice2(*fd_render_gpu, 0, &render_dev) != 0) {
++      if (original_fd)
++         *original_fd = *fd_render_gpu;
+       return false;
++   }
+    if (drmGetDevice2(*fd_render_gpu, 0, &preferred_dev) != 0) {
+       drmFreeDevice(&render_dev);
++      if (original_fd)
++         *original_fd = *fd_render_gpu;
+       return false;
+    };
+    is_render_and_display_gpu_diff = loader_get_user_preferred_device(
+       render_dev, &preferred_dev);
