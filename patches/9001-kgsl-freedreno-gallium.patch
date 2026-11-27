@@ -1,0 +1,4225 @@
+diff --git a/meson.build b/meson.build
+index f725f833a52a..9d731daaeb47 100644
+--- a/meson.build
++++ b/meson.build
+@@ -360,6 +360,10 @@ with_vdrm = [
+   with_intel_virtio,
+ ].contains(true)
+ 
++if freedreno_kmds.contains('kgsl')
++  pre_args += '-DHAVE_FREEDRENO_KGSL'
++endif
++
+ if with_virtio_vk
+   dep_venus_protocol = dependency('venus-protocol',
+     version : '== 1.1.3',
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index 5139f310bc6d..a710bac0c442 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -848,6 +848,21 @@ dri2_setup_device(_EGLDisplay *disp, EGLBoolean software)
+    _EGLDevice *dev;
+    int render_fd;
+ 
++#ifdef HAVE_LIBDRM
++   /* The optional DRM shim exposes KGSL as an EGL render device. Keep the
++    * software-device fallback for applications running without the shim. */
++   if (disp->Options.Kgsl && !software && dri2_dpy->fd_render_gpu >= 0) {
++      dev = _eglFindDevice(dri2_dpy->fd_render_gpu, false);
++      if (dev) {
++         disp->Device = dev;
++         return EGL_TRUE;
++      }
++   }
++#endif
++
++   if (disp->Options.Kgsl || disp->Options.Zink)
++      software = true;
++
+    /* If we're not software, we need a DRM node FD */
+    assert(software || dri2_dpy->fd_render_gpu >= 0);
+ 
+@@ -1315,6 +1330,21 @@ dri2_create_context(_EGLDisplay *disp, _EGLConfig *conf,
+    if (!dri2_ctx->dri_context)
+       goto cleanup;
+ 
++   if (disp->Platform == _EGL_PLATFORM_WAYLAND) {
++      const char *renderer = NULL;
++      const bool is_kgsl_fd740 =
++         dri2_dpy->driver_name && strcmp(dri2_dpy->driver_name, "kgsl") == 0 &&
++         dri_query_renderer_string(dri2_dpy->dri_screen_render_gpu,
++                                   __DRI2_RENDERER_DEVICE_ID, &renderer) == 0 &&
++         renderer && strcmp(renderer, "FD740") == 0;
++
++      /* Wait for FD740 rendering before handing its dma-buf to an
++       * implicit-sync Wayland compositor.
++       */
++      dri_disable_present_wait_fence(dri2_ctx->dri_context,
++         debug_get_bool_option("MESA_DRI3_DISABLE_PRESENT_WAIT_FENCE", !is_kgsl_fd740));
++   }
++
+    mtx_unlock(&dri2_dpy->lock);
+ 
+    return &dri2_ctx->base;
+diff --git a/src/egl/drivers/dri2/platform_drm.c b/src/egl/drivers/dri2/platform_drm.c
+index 0fe6608c2bb1..f3802ced5b32 100644
+--- a/src/egl/drivers/dri2/platform_drm.c
++++ b/src/egl/drivers/dri2/platform_drm.c
+@@ -633,6 +633,8 @@ dri2_initialize_drm(_EGLDisplay *disp)
+ 
+          dri2_dpy->fd_display_gpu =
+             loader_open_device(drm->nodes[DRM_NODE_PRIMARY]);
++      } else if (disp->Options.Kgsl) {
++         dri2_dpy->fd_display_gpu = loader_open_device("/dev/kgsl-3d0");
+       } else {
+          _EGLDevice *dev_list = _eglGlobal.DeviceList;
+          drmDevicePtr drm;
+@@ -673,6 +675,8 @@ dri2_initialize_drm(_EGLDisplay *disp)
+    if (!dri2_dpy->gbm_dri->software) {
+       dri2_dpy->fd_render_gpu =
+          get_fd_render_gpu_drm(dri2_dpy->gbm_dri, dri2_dpy->fd_display_gpu);
++      if (dri2_dpy->fd_render_gpu < 0 && disp->Options.Kgsl)
++         dri2_dpy->fd_render_gpu = dri2_dpy->fd_display_gpu;
+       if (dri2_dpy->fd_render_gpu < 0) {
+          err = "DRI2: failed to get compatible render device";
+          goto cleanup;
+diff --git a/src/egl/drivers/dri2/platform_surfaceless.c b/src/egl/drivers/dri2/platform_surfaceless.c
+index 16b4e3d6033e..a87ca373ba91 100644
+--- a/src/egl/drivers/dri2/platform_surfaceless.c
++++ b/src/egl/drivers/dri2/platform_surfaceless.c
+@@ -394,6 +394,36 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
+       driver_loaded = surfaceless_probe_device_sw(disp);
+    }
+ 
++   if (!driver_loaded && disp->Options.Kgsl) {
++      dri2_dpy->fd_render_gpu = loader_open_device("/dev/kgsl-3d0");
++      if (dri2_dpy->fd_render_gpu >= 0) {
++         dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
++         dri2_dpy->driver_name = strdup("kgsl");
++
++         if (dri2_dpy->driver_name) {
++            dri2_detect_swrast_kopper(disp);
++            dri2_dpy->loader_funcs = &image_loader_funcs;
++
++            /* KGSL is not enumerated as an EGLDevice, but it still needs a
++             * DRI screen before dri2_setup_screen() reads screen caps.
++             */
++            if (dri2_create_screen(disp)) {
++               driver_loaded = true;
++            } else {
++               _eglLog(_EGL_WARNING, "DRI2: failed to create kgsl screen");
++            }
++         }
++
++         if (!driver_loaded) {
++            free(dri2_dpy->driver_name);
++            dri2_dpy->driver_name = NULL;
++            close(dri2_dpy->fd_render_gpu);
++            dri2_dpy->fd_display_gpu = -1;
++            dri2_dpy->fd_render_gpu = -1;
++         }
++      }
++   }
++
+    if (!driver_loaded) {
+       err = "DRI2: failed to load driver";
+       goto cleanup;
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index a377ce5a083b..942ff21225b3 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -2616,6 +2616,9 @@ dri2_initialize_wayland_drm_extensions(struct dri2_egl_display *dri2_dpy)
+       dmabuf_feedback_format_table_fini(&dri2_dpy->format_table);
+    }
+ 
++   if (dri2_dpy->kopper)
++      return true;
++
+ #ifdef HAVE_BIND_WL_DISPLAY
+    /* We couldn't retrieve a render node from the dma-buf feedback (or the
+     * feedback was not advertised at all), so we must fallback to wl_drm. */
+@@ -2642,6 +2645,7 @@ static EGLBoolean
+ dri2_initialize_wayland_drm(_EGLDisplay *disp)
+ {
+    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
++   bool using_kgsl = false;
+ 
+    if (dri2_wl_formats_init(&dri2_dpy->formats) < 0)
+       goto cleanup;
+@@ -2675,34 +2679,59 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
+    if (roundtrip(dri2_dpy) < 0)
+       goto cleanup;
+ 
+-   if (!dri2_initialize_wayland_drm_extensions(dri2_dpy))
+-      goto cleanup;
+-
+-   loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
+-                                &dri2_dpy->fd_display_gpu);
+-
+-   if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu) {
+-      free(dri2_dpy->device_name);
+-      dri2_dpy->device_name =
+-         loader_get_device_name_for_fd(dri2_dpy->fd_render_gpu);
+-      if (!dri2_dpy->device_name) {
+-         _eglError(EGL_BAD_ALLOC, "wayland-egl: failed to get device name "
+-                                  "for requested GPU");
++   if (!dri2_initialize_wayland_drm_extensions(dri2_dpy)) {
++      if (disp->Options.Kgsl) {
++         dri2_dpy->fd_render_gpu = loader_open_device("/dev/kgsl-3d0");
++         using_kgsl = dri2_dpy->fd_render_gpu != -1;
++      } else {
+          goto cleanup;
+       }
+    }
+ 
+-   /* we have to do the check now, because loader_get_user_preferred_fd
+-    * will return a render-node when the requested gpu is different
+-    * to the server, but also if the client asks for the same gpu than
+-    * the server by requesting its pci-id */
+-   dri2_dpy->is_render_node =
+-      drmGetNodeTypeFromFd(dri2_dpy->fd_render_gpu) == DRM_NODE_RENDER;
++   /* On the kgsl stack the compositor advertises neither wl_drm nor a v4
++    * dma-buf feedback main device, so the paths above can leave us without a
++    * render GPU fd even though _extensions() "succeeded" (v3 dma-buf only).
++    * Open the kgsl GPU node directly as a last resort so the native freedreno
++    * GL driver still comes up instead of leaving fd = -1 (-> dri2 screen
++    * creation fails, black window). */
++   if (dri2_dpy->fd_render_gpu == -1) {
++      dri2_dpy->fd_render_gpu = loader_open_device("/dev/kgsl-3d0");
++      if (dri2_dpy->fd_render_gpu == -1)
++         goto cleanup;
++      using_kgsl = true;
++   }
++
++   if (using_kgsl) {
++      dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
++      dri2_dpy->is_render_node = false;
++      dri2_dpy->driver_name = strdup("kgsl");
++   } else {
++      loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
++                                   &dri2_dpy->fd_display_gpu);
+ 
+-   if (disp->Options.Zink)
+-      dri2_dpy->driver_name = strdup("zink");
+-   else
+-      dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
++      if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu) {
++         free(dri2_dpy->device_name);
++         dri2_dpy->device_name =
++            loader_get_device_name_for_fd(dri2_dpy->fd_render_gpu);
++         if (!dri2_dpy->device_name) {
++            _eglError(EGL_BAD_ALLOC, "wayland-egl: failed to get device name "
++                                     "for requested GPU");
++            goto cleanup;
++         }
++      }
++
++      /* we have to do the check now, because loader_get_user_preferred_fd
++       * will return a render-node when the requested gpu is different
++       * to the server, but also if the client asks for the same gpu than
++       * the server by requesting its pci-id */
++      dri2_dpy->is_render_node =
++         drmGetNodeTypeFromFd(dri2_dpy->fd_render_gpu) == DRM_NODE_RENDER;
++
++      if (disp->Options.Zink)
++         dri2_dpy->driver_name = strdup("zink");
++      else
++         dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
++   }
+    if (dri2_dpy->driver_name == NULL) {
+       _eglError(EGL_BAD_ALLOC, "DRI2: failed to get driver name");
+       goto cleanup;
+diff --git a/src/egl/drivers/dri2/platform_x11.c b/src/egl/drivers/dri2/platform_x11.c
+index 292931cf8675..2dd79a75e2b7 100644
+--- a/src/egl/drivers/dri2/platform_x11.c
++++ b/src/egl/drivers/dri2/platform_x11.c
+@@ -591,6 +591,8 @@ dri2_x11_add_configs_for_visuals(struct dri2_egl_display *dri2_dpy,
+    xcb_depth_iterator_t d;
+    xcb_visualtype_t *visuals;
+    EGLint surface_type;
++   const bool kgsl = dri2_dpy->driver_name &&
++                     strcmp(dri2_dpy->driver_name, "kgsl") == 0;
+ 
+    d = xcb_screen_allowed_depths_iterator(dri2_dpy->screen);
+ 
+@@ -607,7 +609,11 @@ dri2_x11_add_configs_for_visuals(struct dri2_egl_display *dri2_dpy,
+       visuals = xcb_depth_visuals(d.data);
+ 
+       for (int i = 0; i < xcb_depth_visuals_length(d.data); i++) {
+-         if (class_added[visuals[i]._class])
++         /* XWayland may expose several equivalent visuals on KGSL.  ANGLE
++          * clients can select one through GLX and then require an EGLConfig
++          * with that exact visual ID when creating an EGL window surface.
++          */
++         if (!kgsl && class_added[visuals[i]._class])
+             continue;
+ 
+          class_added[visuals[i]._class] = EGL_TRUE;
+diff --git a/src/egl/drivers/dri2/platform_x11_dri3.c b/src/egl/drivers/dri2/platform_x11_dri3.c
+index 1312510baaa1..ca76cfc001cb 100644
+--- a/src/egl/drivers/dri2/platform_x11_dri3.c
++++ b/src/egl/drivers/dri2/platform_x11_dri3.c
+@@ -101,12 +101,22 @@ egl_dri3_flush_drawable(struct loader_dri3_drawable *draw, unsigned flags)
+    dri2_flush_drawable_for_swapbuffers(disp, &dri3_surf->surf.base);
+ }
+ 
++static int
++egl_dri3_flush_drawable_with_fence_fd(struct loader_dri3_drawable *draw,
++                                      unsigned flags)
++{
++   return loader_dri3_flush_with_fence_fd(
++      draw, __DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_INVALIDATE_ANCILLARY,
++      __DRI2_THROTTLE_SWAPBUFFER);
++}
++
+ static const struct loader_dri3_vtable egl_dri3_vtable = {
+    .set_drawable_size = egl_dri3_set_drawable_size,
+    .in_current_context = egl_dri3_in_current_context,
+    .get_dri_context = egl_dri3_get_dri_context,
+    .get_dri_screen = egl_dri3_get_dri_screen,
+    .flush_drawable = egl_dri3_flush_drawable,
++   .flush_drawable_with_fence_fd = egl_dri3_flush_drawable_with_fence_fd,
+ };
+ 
+ static EGLBoolean
+@@ -520,7 +530,7 @@ dri3_x11_connect(struct dri2_egl_display *dri2_dpy, bool swrast)
+             _eglLog(_EGL_WARNING, "DRI3: Failed to initialize");
+       }
+ 
+-      return false;
++      return true;
+    }
+ 
+    loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
+diff --git a/src/egl/main/eglapi.c b/src/egl/main/eglapi.c
+index a6c6f95f1d53..d844041b8392 100644
+--- a/src/egl/main/eglapi.c
++++ b/src/egl/main/eglapi.c
+@@ -684,7 +684,13 @@ eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
+                  "Found 'LIBGL_ALWAYS_SOFTWARE' set, will use a CPU renderer");
+ 
+       const char *env = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
+-      disp->Options.Zink = env && !strcmp(env, "zink");
++      const char *backend = os_get_option("TERMUX_VA_GPU_BACKEND");
++      const bool kgsl_backend = backend && !strcmp(backend, "kgsl");
++      if (!env && kgsl_backend &&
++          setenv("MESA_LOADER_DRIVER_OVERRIDE", "kgsl", 0) == 0)
++         env = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
++      disp->Options.Zink = !kgsl_backend && (!env || !strcmp(env, "zink"));
++      disp->Options.Kgsl = kgsl_backend || (env && !strcmp(env, "kgsl"));
+ 
+       const char *gallium_hud_env = os_get_option("GALLIUM_HUD");
+       disp->Options.GalliumHudWarn =
+diff --git a/src/egl/main/egldisplay.h b/src/egl/main/egldisplay.h
+index 6178140e7e74..169ccf052d54 100644
+--- a/src/egl/main/egldisplay.h
++++ b/src/egl/main/egldisplay.h
+@@ -198,6 +198,7 @@ struct _egl_display {
+ 
+    /* options that affect how the driver initializes the display */
+    struct {
++      EGLBoolean Kgsl;           /**< Use kgsl only */
+       EGLBoolean Zink;           /**< Use kopper only */
+       EGLBoolean ForceSoftware;  /**< Use software path only */
+       EGLBoolean GalliumHudWarn; /**< Using hud, warn when querying buffer age */
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+index 6eda8101e46c..cb6f523c7902 100644
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -268,6 +268,24 @@ fd_bo_from_dmabuf(struct fd_device *dev, int fd)
+    return dev->funcs->bo_from_dmabuf(dev, fd);
+ }
+ 
++int
++fd_bo_sync_to_gpu(struct fd_bo *bo)
++{
++   if (!bo)
++      return 0;
++
++   /* Uploaders commonly suballocate small command, vertex, and constant
++    * buffers from a KGSL heap block.  The suballocation has no kernel handle
++    * of its own, so synchronize the real backing BO instead. */
++   if (suballoc_bo(bo))
++      bo = fd_bo_heap_block(bo);
++
++   if (!bo->funcs->sync_to_gpu)
++      return 0;
++
++   return bo->funcs->sync_to_gpu(bo);
++}
++
+ struct fd_bo *
+ fd_bo_from_name(struct fd_device *dev, uint32_t name)
+ {
+@@ -684,8 +702,10 @@ int
+ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
+    enum fd_bo_state state = fd_bo_state(bo);
++   const bool may_be_shared = fd_bo_may_be_shared(bo);
+ 
+-   if (state == FD_BO_STATE_IDLE)
++   /* Idle in Mesa does not rule out an external fence on a shared BO. */
++   if (state == FD_BO_STATE_IDLE && (!may_be_shared || op == FD_BO_PREP_FLUSH))
+       return 0;
+ 
+    MESA_TRACE_FUNC();
+@@ -734,10 +754,8 @@ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+    /* expire completed fences */
+    fd_bo_state(bo);
+ 
+-   /* None shared buffers will not have any external usage (ie. fences
+-    * that we are not aware of) so nothing more to do.
+-    */
+-   if (!(bo->alloc_flags & FD_BO_SHARED))
++   /* Only shared BOs may have fences from other users of the buffer. */
++   if (!may_be_shared)
+       return 0;
+ 
+    /* If buffer is shared, but we are using explicit sync, no need to
+@@ -844,4 +862,3 @@ fd_bo_state(struct fd_bo *bo)
+ 
+    return FD_BO_STATE_BUSY;
+ }
+-
+diff --git a/src/freedreno/drm/freedreno_device.c b/src/freedreno/drm/freedreno_device.c
+index 6c64e64171a6..141716bbfc71 100644
+--- a/src/freedreno/drm/freedreno_device.c
++++ b/src/freedreno/drm/freedreno_device.c
+@@ -6,6 +6,7 @@
+  *    Rob Clark <robclark@freedesktop.org>
+  */
+ 
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -23,6 +24,9 @@ struct fd_device *msm_device_new(int fd, drmVersionPtr version);
+ #ifdef HAVE_FREEDRENO_VIRTIO
+ struct fd_device *virtio_device_new(int fd, drmVersionPtr version);
+ #endif
++#ifdef HAVE_FREEDRENO_KGSL
++struct fd_device *kgsl_device_new(int fd);
++#endif
+ 
+ uint64_t os_page_size = 4096;
+ 
+@@ -30,17 +34,52 @@ struct fd_device *
+ fd_device_new(int fd)
+ {
+    struct fd_device *dev = NULL;
+-   drmVersionPtr version;
++   drmVersionPtr version = NULL;
+    bool use_heap = false;
++   bool support_use_heap = true;
++   /* The fd used for GPU submission. Defaults to the fd we were handed, but on
++    * the kgsl stack it is redirected to the kgsl GPU node while the original fd
++    * is retained as the device control/identity fd (see below). */
++   int gpu_fd = fd;
+ 
+    os_get_page_size(&os_page_size);
+ 
++#if HAVE_FREEDRENO_KGSL
++   /* On the kgsl stack the Adreno GPU is reachable only through the
++    * /dev/kgsl-3d0 char device, never through a DRM render node.  EGL/GBM may
++    * hand us the display controller's DRM node (sde-kms renderD128), which
++    * drmGetVersion reports as "msm" even though it drives no GPU at all -
++    * taking the msm path there yields a half-initialised screen that crashes
++    * on the first capability query.  When kgsl is forced (the whole kgsl stack
++    * exports FD_FORCE_KGSL=1), ignore the fd we were handed and open the kgsl
++    * GPU node directly for rendering.  The fd we were handed is kept as the
++    * device control/identity fd (dev->control_fd, returned by fd_device_fd):
++    * it still identifies the screen for u_pipe_screen_lookup_or_create()'s
++    * fd-keyed cache (which compares file descriptions, so dev->fd MUST stay a
++    * dup of the cache key - a freshly opened kgsl fd is a different file
++    * description and would break cache eviction -> use-after-free) and is the
++    * fd handed to DRI3 clients.  Only GPU submission uses the kgsl fd. */
++   if (debug_get_bool_option("FD_FORCE_KGSL", false)) {
++      int kgsl_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
++      if (kgsl_fd >= 0) {
++         dev = kgsl_device_new(kgsl_fd);
++         if (dev) {
++            /* Userspace fences are not supported with KGSL */
++            support_use_heap = false;
++            gpu_fd = kgsl_fd;   /* render on kgsl, keep fd as control_fd */
++            goto out;
++         }
++         close(kgsl_fd);
++      }
++   }
++#endif
++
++#ifdef HAVE_LIBDRM
+    /* figure out if we are kgsl or msm drm driver: */
+    version = drmGetVersion(fd);
+-   if (!version) {
+-      ERROR_MSG("cannot get version: %s", strerror(errno));
+-      return NULL;
+-   }
++   if (!version)
++      DEBUG_MSG("cannot get version: %s", strerror(errno));
++#endif
+ 
+ #ifdef HAVE_FREEDRENO_VIRTIO
+    if (debug_get_bool_option("FD_FORCE_VTEST", false)) {
+@@ -48,7 +87,7 @@ fd_device_new(int fd)
+       dev = virtio_device_new(-1, version);
+    } else
+ #endif
+-   if (!strcmp(version->name, "msm")) {
++   if (version && !strcmp(version->name, "msm")) {
+       DEBUG_MSG("msm DRM device");
+       if (version->version_major != 1) {
+          ERROR_MSG("unsupported version: %u.%u.%u", version->version_major,
+@@ -58,7 +97,7 @@ fd_device_new(int fd)
+ 
+       dev = msm_device_new(fd, version);
+ #ifdef HAVE_FREEDRENO_VIRTIO
+-   } else if (!strcmp(version->name, "virtio_gpu")) {
++   } else if (version && !strcmp(version->name, "virtio_gpu")) {
+       DEBUG_MSG("virtio_gpu DRM device");
+       dev = virtio_device_new(fd, version);
+       /* Only devices that support a hypervisor are a6xx+, so avoid the
+@@ -67,14 +106,42 @@ fd_device_new(int fd)
+       use_heap = true;
+ #endif
+ #if HAVE_FREEDRENO_KGSL
+-   } else if (!strcmp(version->name, "kgsl")) {
+-      DEBUG_MSG("kgsl DRM device");
++   } else {
++      /* If drm driver not detected assume this is KGSL */
+       dev = kgsl_device_new(fd);
++      /* Userspace fences are not supported with KGSL */
++      support_use_heap = false;
++      if (dev)
++         goto out;
+ #endif
+    }
+ 
++#if HAVE_FREEDRENO_KGSL
++   /* On the kgsl stack the Adreno GPU is reachable only through the
++    * /dev/kgsl-3d0 char device, never through a DRM render node.  When EGL is
++    * driven via GBM (e.g. Xwayland glamor) the fd handed to us is the display
++    * controller's DRM node (sde-kms renderD128) or some other non-kgsl fd, so
++    * neither the msm path nor kgsl-on-this-fd above can produce a device.
++    * Open the kgsl GPU node directly as a last resort so native freedreno GL
++    * still comes up instead of failing dri2 screen creation. */
++   if (!dev) {
++      int kgsl_fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
++      if (kgsl_fd >= 0) {
++         dev = kgsl_device_new(kgsl_fd);
++         if (dev) {
++            support_use_heap = false;
++            /* Render on the kgsl GPU node; keep the fd we were handed as the
++             * control/identity fd (see the FD_FORCE_KGSL block above). */
++            gpu_fd = kgsl_fd;
++         } else {
++            close(kgsl_fd);
++         }
++      }
++   }
++#endif
++
+    if (!dev) {
+-      INFO_MSG("unsupported device: %s", version->name);
++      INFO_MSG("unsupported device: %s", version ? version->name : "(none)");
+       goto out;
+    }
+ 
+@@ -90,7 +157,11 @@ fd_device_new(int fd)
+    fd_rd_output_init(&dev->rd, util_get_process_name());
+ 
+    p_atomic_set(&dev->refcnt, 1);
+-   dev->fd = fd;
++   dev->fd = gpu_fd;
++   /* control_fd identifies the screen for the fd-keyed screen cache and DRI3;
++    * it is a dup of the cache key. It equals fd unless rendering was redirected
++    * to a separate kgsl GPU node above, in which case fd != gpu_fd. */
++   dev->control_fd = fd;
+    dev->handle_table =
+       _mesa_hash_table_create(NULL, _mesa_hash_u32, _mesa_key_u32_equal);
+    dev->name_table =
+@@ -117,7 +188,7 @@ fd_device_new(int fd)
+       fd_pipe_del(pipe);
+    }
+ 
+-   if (use_heap) {
++   if (support_use_heap && use_heap) {
+       dev->ring_heap = fd_bo_heap_new(dev, RING_FLAGS);
+       dev->default_heap = fd_bo_heap_new(dev, 0);
+    }
+@@ -210,8 +281,14 @@ fd_device_del(struct fd_device *dev)
+    if (fd_device_threaded_submit(dev))
+       util_queue_destroy(&dev->submit_queue);
+ 
+-   if (dev->closefd)
++   if (dev->closefd) {
+       close(dev->fd);
++      /* On the kgsl stack control_fd is a distinct fd from the kgsl GPU fd;
++       * close it too so it does not leak (guard against double-close when they
++       * are the same fd, the common case). */
++      if (dev->control_fd >= 0 && dev->control_fd != dev->fd)
++         close(dev->control_fd);
++   }
+ 
+    free(dev);
+ }
+@@ -219,7 +296,10 @@ fd_device_del(struct fd_device *dev)
+ int
+ fd_device_fd(struct fd_device *dev)
+ {
+-   return dev->fd;
++   /* Return the control/identity fd, not the GPU submission fd. On the kgsl
++    * stack these differ: the screen cache and DRI3 must see the fd we were
++    * handed (a dup of the cache key), while GPU submission uses dev->fd. */
++   return dev->control_fd;
+ }
+ 
+ enum fd_version
+@@ -242,6 +322,12 @@ fd_dbg(void)
+    return debug_get_option_libgl();
+ }
+ 
++uint32_t
++fd_get_features(struct fd_device *dev)
++{
++   return dev->features;
++}
++
+ bool
+ fd_has_syncobj(struct fd_device *dev)
+ {
+diff --git a/src/freedreno/drm/freedreno_drmif.h b/src/freedreno/drm/freedreno_drmif.h
+index ecb84aa57f81..2226acc3deac 100644
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -50,6 +50,13 @@ enum fd_param_id {
+    FD_UCHE_TRAP_BASE,
+ };
+ 
++enum fd_reset_status {
++   FD_RESET_NO_ERROR,
++   FD_RESET_GUILTY,
++   FD_RESET_INNOCENT,
++   FD_RESET_UNKNOWN,
++};
++
+ /**
+  * Helper for fence/seqno comparisions which deals properly with rollover.
+  * Returns true if fence 'a' is before fence 'b'
+@@ -181,6 +188,13 @@ enum fd_version {
+ enum fd_version fd_device_version(struct fd_device *dev);
+ void fd_device_disable_explicit_sync_heuristic(struct fd_device *dev);
+ 
++enum fd_features {
++   FD_FEATURE_DIRECT_RESET = 1,
++   FD_FEATURE_IMPORT_DMABUF = 2,
++   FD_FEATURE_KGSL = 4,
++};
++
++uint32_t fd_get_features(struct fd_device *dev);
+ bool fd_has_syncobj(struct fd_device *dev);
+ 
+ /* pipe functions:
+@@ -202,6 +216,7 @@ int fd_pipe_wait(struct fd_pipe *pipe, const struct fd_fence *fence);
+ /* timeout in nanosec */
+ int fd_pipe_wait_timeout(struct fd_pipe *pipe, const struct fd_fence *fence,
+                          uint64_t timeout);
++int fd_pipe_get_reset_status(struct fd_pipe *pipe, enum fd_reset_status *status);
+ 
+ /* buffer-object functions:
+  */
+@@ -298,9 +313,14 @@ void fd_bo_del(struct fd_bo *bo);
+ void fd_bo_del_array(struct fd_bo **bos, int count);
+ void fd_bo_del_list_nocache(struct list_head *list);
+ int fd_bo_get_name(struct fd_bo *bo, uint32_t *name);
++/* Return the BO's handle in its owning device's namespace, not a handle for
++ * another device used for scanout.  Native KGSL BOs need not be dma-buf
++ * exportable to have a valid handle.  Suballocated BOs return zero.
++ */
+ uint32_t fd_bo_handle(struct fd_bo *bo);
+ int fd_bo_dmabuf_drm(struct fd_bo *bo);
+ int fd_bo_dmabuf(struct fd_bo *bo);
++int fd_bo_sync_to_gpu(struct fd_bo *bo);
+ uint32_t fd_bo_size(struct fd_bo *bo);
+ void *fd_bo_map(struct fd_bo *bo);
+ void fd_bo_upload(struct fd_bo *bo, void *src, unsigned off, unsigned len);
+diff --git a/src/freedreno/drm/freedreno_pipe.c b/src/freedreno/drm/freedreno_pipe.c
+index 53b72283d979..c2a008f489b2 100644
+--- a/src/freedreno/drm/freedreno_pipe.c
++++ b/src/freedreno/drm/freedreno_pipe.c
+@@ -215,6 +215,12 @@ fd_pipe_emit_fence(struct fd_pipe *pipe, struct fd_ringbuffer *ring)
+    return fence;
+ }
+ 
++int
++fd_pipe_get_reset_status(struct fd_pipe *pipe, enum fd_reset_status *status)
++{
++   return pipe->funcs->reset_status(pipe, status);
++}
++
+ struct fd_fence *
+ fd_fence_new(struct fd_pipe *pipe, bool use_fence_fd)
+ {
+diff --git a/src/freedreno/drm/freedreno_priv.h b/src/freedreno/drm/freedreno_priv.h
+index 3a243b6cd84e..8feab9928d58 100644
+--- a/src/freedreno/drm/freedreno_priv.h
++++ b/src/freedreno/drm/freedreno_priv.h
+@@ -188,9 +188,11 @@ submit_offset(struct fd_bo *bo, uint32_t offset)
+ }
+ 
+ struct fd_device {
+-   int fd;
++   int fd;          /* GPU submission fd (kgsl GPU node on the kgsl stack) */
++   int control_fd;  /* screen-cache / DRI3 identity fd; == fd unless redirected */
+    enum fd_version version;
+    int32_t refcnt;
++   uint32_t features;
+ 
+    /* tables to keep track of bo's, to avoid "evil-twin" fd_bo objects:
+     *
+@@ -296,6 +298,7 @@ struct fd_pipe_funcs {
+    struct fd_ringbuffer *(*ringbuffer_new_object)(struct fd_pipe *pipe,
+                                                   uint32_t size);
+    struct fd_submit *(*submit_new)(struct fd_pipe *pipe);
++   int (*reset_status)(struct fd_pipe *pipe, enum fd_reset_status *status);
+ 
+    /**
+     * Flush any deferred submits (if deferred submits are supported by
+@@ -421,6 +424,7 @@ struct fd_bo_funcs {
+    uint64_t (*iova)(struct fd_bo *bo);
+    void (*set_name)(struct fd_bo *bo, const char *fmt, va_list ap);
+    int (*dmabuf)(struct fd_bo *bo);
++   int (*sync_to_gpu)(struct fd_bo *bo);
+ 
+    /**
+     * Optional hook that is called before ->destroy().  In the case of
+@@ -451,6 +455,15 @@ struct fd_bo_funcs {
+    int (*get_metadata)(struct fd_bo *bo, void *metadata, uint32_t metadata_size);
+ };
+ 
++static inline bool
++fd_bo_may_be_shared(const struct fd_bo *bo)
++{
++   /* KGSL also allocates scanout-only BOs through dma-buf. */
++   return (bo->alloc_flags & FD_BO_SHARED) ||
++          ((bo->alloc_flags & FD_BO_SCANOUT) &&
++           (bo->dev->features & FD_FEATURE_KGSL));
++}
++
+ void fd_bo_add_fence(struct fd_bo *bo, struct fd_fence *fence);
+ void *fd_bo_map_os_mmap(struct fd_bo *bo);
+ void *__fd_bo_map(struct fd_bo *bo);
+diff --git a/src/freedreno/drm/freedreno_ringbuffer_sp.c b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+index 7f50fccba805..2d75adfc413e 100644
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -215,7 +215,7 @@ fd_submit_sp_flush_prep(struct fd_submit *submit, int in_fence_fd,
+    simple_mtx_lock(&fence_lock);
+    for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
+       fd_bo_add_fence(fd_submit->bos[i], out_fence);
+-      has_shared |= fd_submit->bos[i]->alloc_flags & FD_BO_SHARED;
++      has_shared |= fd_bo_may_be_shared(fd_submit->bos[i]);
+    }
+    for (unsigned i = 0; i < fd_submit->nr_suballoc_bos; i++) {
+       fd_bo_add_fence(fd_submit->suballoc_bos[i], out_fence);
+@@ -328,8 +328,10 @@ should_defer(struct fd_submit *submit)
+ static struct fd_fence *
+ fd_submit_sp_flush(struct fd_submit *submit, int in_fence_fd, bool use_fence_fd)
+ {
++   struct fd_submit_sp *fd_submit = to_fd_submit_sp(submit);
+    struct fd_device *dev = submit->pipe->dev;
+    struct fd_pipe *pipe = submit->pipe;
++   const bool is_kgsl = dev->features & FD_FEATURE_KGSL;
+ 
+    MESA_TRACE_FUNC();
+ 
+@@ -360,7 +362,12 @@ fd_submit_sp_flush(struct fd_submit *submit, int in_fence_fd, bool use_fence_fd)
+ 
+    bool has_shared = fd_submit_sp_flush_prep(submit, in_fence_fd, out_fence);
+ 
+-   if (((in_fence_fd != -1) || out_fence->use_fence_fd) && !dev->disable_explicit_sync_heuristic)
++   /* KGSL must still wait for implicit client fences when a compositor only
++    * requests an explicit fence for its output.
++    */
++   bool explicit_sync = in_fence_fd != -1 ||
++                        (out_fence->use_fence_fd && !is_kgsl);
++   if (explicit_sync && !dev->disable_explicit_sync_heuristic)
+       pipe->no_implicit_sync = true;
+ 
+    /* The rule about skipping submit merging with shared buffers is only
+@@ -369,6 +376,8 @@ fd_submit_sp_flush(struct fd_submit *submit, int in_fence_fd, bool use_fence_fd)
+    if (pipe->no_implicit_sync)
+       has_shared = false;
+ 
++   fd_submit->wait_shared_bos = has_shared && is_kgsl;
++
+    assert(fd_fence_before(pipe->last_enqueue_fence, submit->fence));
+    pipe->last_enqueue_fence = submit->fence;
+ 
+diff --git a/src/freedreno/drm/freedreno_ringbuffer_sp.h b/src/freedreno/drm/freedreno_ringbuffer_sp.h
+index 27d1873d338f..006182c6d622 100644
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.h
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.h
+@@ -60,6 +60,7 @@ struct fd_submit_sp {
+     */
+    int in_fence_fd;
+    struct fd_fence *out_fence;
++   bool wait_shared_bos;
+ 
+    /* State for enqueued submits:
+     */
+diff --git a/src/freedreno/drm/kgsl/kgsl_bo.c b/src/freedreno/drm/kgsl/kgsl_bo.c
+new file mode 100644
+index 000000000000..1c49cfd06eaa
+--- /dev/null
++++ b/src/freedreno/drm/kgsl/kgsl_bo.c
+@@ -0,0 +1,392 @@
++#include "kgsl_priv.h"
++#include "util/os_file.h"
++#include "util/os_mman.h"
++
++#include <linux/dma-heap.h>
++#include <poll.h>
++
++static uint64_t
++kgsl_bo_iova(struct fd_bo *bo)
++{
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    return kgsl_bo->iova;
++}
++
++static void
++kgsl_bo_set_name(struct fd_bo *bo, const char *fmt, va_list ap)
++{
++    /* This function is a no op for KGSL */
++    return;
++}
++
++static int
++kgsl_bo_offset(struct fd_bo *bo, uint64_t *offset)
++{
++    /* from tu_kgsl.c - offset for mmap needs to be */
++    /* the returned alloc id shifted over 12 */
++    *offset = bo->handle << 12;
++    return 0;
++}
++
++static int
++kgsl_bo_madvise(struct fd_bo *bo, int willneed)
++{
++    /* KGSL does not support this, so simply return willneed */
++    return willneed;
++}
++
++int
++kgsl_bo_wait_dmabuf(struct fd_bo *bo, uint32_t op)
++{
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    if (kgsl_bo->bo_type != KGSL_BO_IMPORT)
++        return 0;
++    if (kgsl_bo->import_fd < 0)
++        return -EBADF;
++
++    struct pollfd pfd = {
++        .fd = kgsl_bo->import_fd,
++        .events = (op & FD_BO_PREP_WRITE) ? POLLOUT : POLLIN,
++    };
++    int ret;
++    do {
++        ret = poll(&pfd, 1, (op & FD_BO_PREP_NOSYNC) ? 0 : -1);
++    } while (ret < 0 && errno == EINTR);
++
++    if (ret < 0)
++        return -errno;
++    if (!ret)
++        return -EBUSY;
++    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
++        return -EIO;
++
++    return (pfd.revents & pfd.events) ? 0 : -EIO;
++}
++
++static int
++kgsl_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++{
++    return kgsl_bo_wait_dmabuf(bo, op);
++}
++
++void
++kgsl_bo_close_handle(struct fd_bo *bo)
++{
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    if (kgsl_bo->bo_type == KGSL_BO_IMPORT) {
++       close(kgsl_bo->import_fd);
++    }
++
++    struct kgsl_gpumem_free_id req = {
++        .id = bo->handle
++    };
++
++    kgsl_pipe_safe_ioctl(bo->dev->fd, IOCTL_KGSL_GPUMEM_FREE_ID, &req);
++}
++
++static void
++kgsl_bo_destroy(struct fd_bo *bo)
++{
++    /* KGSL will immediately delete the BO when we close
++     * the handle, so wait on all fences to ensure
++     * the GPU is done using it before we destory it
++     */
++    for (uint32_t i = 0; i < bo->nr_fences; i++) {
++        struct fd_pipe *pipe = bo->fences[i]->pipe;
++        pipe->funcs->wait(pipe, bo->fences[i], ~0);
++    }
++
++    fd_bo_fini_common(bo);
++}
++
++static void *
++kgsl_bo_map(struct fd_bo *bo)
++{
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    if (!bo->map) {
++        if (kgsl_bo->bo_type == KGSL_BO_IMPORT) {
++            /* in `fd_bo_map` if it tries to mmap this BO. mmap logic is copied from
++             * https://android.googlesource.com/platform/hardware/libhardware/+/master/modules/gralloc/mapper.cpp#44
++             */
++            bo->map = os_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED, kgsl_bo->import_fd, 0);
++        } else {
++            uint64_t offset;
++            int ret;
++
++            ret = bo->funcs->offset(bo, &offset);
++            if (ret) {
++                return NULL;
++            }
++
++            bo->map = os_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
++                    bo->dev->fd, offset);
++            if (bo->map == MAP_FAILED) {
++                ERROR_MSG("mmap failed: %s", strerror(errno));
++                bo->map = NULL;
++            }
++        }
++
++        if (bo->map == MAP_FAILED) {
++            ERROR_MSG("mmap failed: %s", strerror(errno));
++            bo->map = NULL;
++        }
++    }
++    return bo->map;
++}
++
++static int kgsl_bo_dmabuf(struct fd_bo *bo) {
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++
++    if (kgsl_bo->bo_type != KGSL_BO_IMPORT || kgsl_bo->import_fd < 0)
++        return -1;
++
++    return os_dupfd_cloexec(kgsl_bo->import_fd);
++}
++
++static int
++kgsl_bo_sync_to_gpu(struct fd_bo *bo)
++{
++    /* The legacy GPUOBJ_SYNC path is not implemented consistently by all
++     * Android KGSL kernels.  Try the explicit cache ioctl first; this is the
++     * operation that tells the dma-buf exporter to clean CPU lines for a GPU
++     * consumer. */
++    struct kgsl_gpumem_sync_cache cache = {
++        .gpuaddr = 0,
++        .id = bo->handle,
++        .op = KGSL_GPUMEM_CACHE_FLUSH,
++        .offset = 0,
++        .length = bo->size,
++    };
++    int cache_ret = kgsl_pipe_safe_ioctl(bo->dev->fd,
++                                         IOCTL_KGSL_GPUMEM_SYNC_CACHE,
++                                         &cache);
++
++    struct kgsl_gpuobj_sync_obj sync_obj = {
++        .offset = 0,
++        .length = bo->size,
++        .id = bo->handle,
++        .op = KGSL_GPUMEM_CACHE_FLUSH,
++    };
++    struct kgsl_gpuobj_sync sync = {
++        .objs = (uintptr_t)&sync_obj,
++        .obj_len = sizeof(sync_obj),
++        .count = 1,
++    };
++
++    int obj_ret = kgsl_pipe_safe_ioctl(bo->dev->fd,
++                                       IOCTL_KGSL_GPUOBJ_SYNC, &sync);
++    if (getenv("DMD_VA_LOG"))
++        fprintf(stderr, "kgsl: sync-to-gpu id=%u size=%u cache=%d/%d obj=%d/%d\n",
++                bo->handle, bo->size, cache_ret, cache_ret ? errno : 0,
++                obj_ret, obj_ret ? errno : 0);
++
++    if (cache_ret == 0 || obj_ret == 0)
++        return 0;
++    return obj_ret;
++}
++
++static const struct fd_bo_funcs bo_funcs = {
++    .iova = kgsl_bo_iova,
++    .set_name = kgsl_bo_set_name,
++    .offset = kgsl_bo_offset,
++    .map = kgsl_bo_map,
++    .madvise = kgsl_bo_madvise,
++    .cpu_prep = kgsl_bo_cpu_prep,
++    .destroy = kgsl_bo_destroy,
++    .dmabuf = kgsl_bo_dmabuf,
++    .sync_to_gpu = kgsl_bo_sync_to_gpu,
++};
++
++/* Size is not used by KGSL */
++struct fd_bo *
++kgsl_bo_from_handle(struct fd_device *dev, uint32_t size, uint32_t handle)
++{
++    struct fd_bo *bo;
++    int ret;
++    struct kgsl_gpuobj_info req = {
++        .id = handle,
++    };
++
++    ret = kgsl_pipe_safe_ioctl(dev->fd,
++            IOCTL_KGSL_GPUOBJ_INFO, &req);
++
++    if (ret) {
++        ERROR_MSG("Failed to get handle info (%s)", strerror(errno));
++        return NULL;
++    }
++
++    struct kgsl_bo *kgsl_bo = calloc(1, sizeof(*kgsl_bo));
++    if (!kgsl_bo)
++        return NULL;
++
++    bo = &kgsl_bo->base;
++    bo->dev = dev;
++    bo->size = req.size;
++    bo->handle = req.id;
++    bo->funcs = &bo_funcs;
++
++    kgsl_bo->iova = req.gpuaddr;
++
++    fd_bo_init_common(bo, dev);
++
++    return bo;
++}
++
++struct fd_bo *
++kgsl_bo_from_dmabuf(struct fd_device *dev, int fd)
++{
++    struct fd_bo *bo;
++    struct kgsl_gpuobj_import_dma_buf import_dmabuf = {
++        .fd = fd,
++    };
++    struct kgsl_gpuobj_import req = {
++        .priv = (uintptr_t)&import_dmabuf,
++        .priv_len = sizeof(import_dmabuf),
++        .flags = 0,
++        .type = KGSL_USER_MEM_TYPE_DMABUF,
++    };
++    int ret;
++
++    ret = kgsl_pipe_safe_ioctl(dev->fd,
++            IOCTL_KGSL_GPUOBJ_IMPORT, &req);
++
++    if (ret) {
++        ERROR_MSG("Failed to import dma-buf (%s)", strerror(errno));
++        return NULL;
++    }
++
++    bo = fd_bo_from_handle(dev, req.id, 0);
++
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    kgsl_bo->bo_type = KGSL_BO_IMPORT;
++    kgsl_bo->import_fd = os_dupfd_cloexec(fd);
++
++    /* A dma-buf may have been populated through a cached CPU mapping in
++     * another API (for example the termux-va VA bridge).  KGSL does not
++     * infer that CPU-to-GPU transition from the dma-buf import itself.  Flush
++     * the imported object before the first GPU read, matching Turnip's KGSL
++     * import path.  Keep import successful on kernels which do not implement
++     * GPUOBJ_SYNC; those kernels still retain the historical behaviour. */
++    struct kgsl_gpuobj_sync_obj sync_obj = {
++        .offset = 0,
++        .length = bo->size,
++        .id = bo->handle,
++        .op = KGSL_GPUMEM_CACHE_FLUSH,
++    };
++    struct kgsl_gpuobj_sync sync = {
++        .objs = (uintptr_t)&sync_obj,
++        .obj_len = sizeof(sync_obj),
++        .count = 1,
++    };
++    if (kgsl_pipe_safe_ioctl(dev->fd, IOCTL_KGSL_GPUOBJ_SYNC, &sync) != 0 &&
++        getenv("DMD_VA_LOG"))
++        fprintf(stderr, "kgsl: dma-buf GPU cache sync failed id=%u errno=%d\n",
++                bo->handle, errno);
++
++    return bo;
++}
++
++static int
++dma_heap_alloc(uint64_t size)
++{
++   int ret;
++   int dma_heap = open("/dev/dma_heap/system", O_RDONLY);
++
++   if (dma_heap < 0) {
++      int ion_heap = open("/dev/ion", O_RDONLY);
++
++      if (ion_heap < 0)
++         return -1;
++
++      struct ion_allocation_data {
++         __u64 len;
++         __u32 heap_id_mask;
++         __u32 flags;
++         __u32 fd;
++         __u32 unused;
++      } alloc_data = {
++         .len = size,
++         /* ION_HEAP_SYSTEM | ION_SYSTEM_HEAP_ID */
++         .heap_id_mask = (1U << 0) | (1U << 25),
++         .flags = 0, /* uncached */
++      };
++
++      ret = kgsl_pipe_safe_ioctl(ion_heap, _IOWR('I', 0, struct ion_allocation_data),
++                      &alloc_data);
++
++      close(ion_heap);
++
++      if (ret)
++         return -1;
++
++      return alloc_data.fd;
++   } else {
++      struct dma_heap_allocation_data alloc_data = {
++         .len = size,
++         .fd_flags = O_RDWR | O_CLOEXEC,
++      };
++
++      ret = kgsl_pipe_safe_ioctl(dma_heap, DMA_HEAP_IOCTL_ALLOC, &alloc_data);
++
++      close(dma_heap);
++
++      if (ret)
++         return -1;
++
++      return alloc_data.fd;
++   }
++}
++
++static struct fd_bo *
++kgsl_bo_new_dmabuf(struct fd_device *dev, uint32_t size)
++{
++   int fd;
++   struct fd_bo *bo;
++
++   fd = dma_heap_alloc(size);
++   if (fd < 0) {
++      ERROR_MSG("Failed to allocate dma-buf (%s)", strerror(errno));
++      return NULL;
++   }
++
++   bo = kgsl_bo_from_dmabuf(dev, fd);
++
++   close(fd);
++   return bo;
++}
++
++struct fd_bo *
++kgsl_bo_new(struct fd_device *dev, uint32_t size, uint32_t flags)
++{
++    if (flags & (FD_BO_SHARED | FD_BO_SCANOUT)) {
++       return kgsl_bo_new_dmabuf(dev, size);
++    }
++
++    int ret;
++    struct fd_bo *bo;
++    struct kgsl_gpumem_alloc_id req = {
++        .size = size,
++    };
++
++    if (flags & FD_BO_GPUREADONLY)
++        req.flags |= KGSL_MEMFLAGS_GPUREADONLY;
++
++    ret = kgsl_pipe_safe_ioctl(dev->fd, IOCTL_KGSL_GPUMEM_ALLOC_ID, &req);
++
++    if (ret) {
++        ERROR_MSG("GPUMEM_ALLOC_ID failed (%s)", strerror(errno));
++        return NULL;
++    }
++
++    bo = kgsl_bo_from_handle(dev, size, req.id);
++
++    struct kgsl_bo *kgsl_bo = to_kgsl_bo(bo);
++    kgsl_bo->bo_type = KGSL_BO_NATIVE;
++
++    if (!bo) {
++        ERROR_MSG("Failed to allocate buffer object");
++        return NULL;
++    }
++
++    return bo;
++}
+diff --git a/src/freedreno/drm/kgsl/kgsl_device.c b/src/freedreno/drm/kgsl/kgsl_device.c
+new file mode 100644
+index 000000000000..76bd7de162da
+--- /dev/null
++++ b/src/freedreno/drm/kgsl/kgsl_device.c
+@@ -0,0 +1,44 @@
++#include "kgsl_priv.h"
++
++static const struct fd_device_funcs funcs = {
++    .bo_new = kgsl_bo_new,
++    .pipe_new = kgsl_pipe_new,
++    .bo_from_handle = kgsl_bo_from_handle,
++    .bo_from_dmabuf = kgsl_bo_from_dmabuf,
++    .bo_close_handle = kgsl_bo_close_handle,
++    .destroy = kgsl_device_destroy,
++};
++
++struct fd_device *
++kgsl_device_new(int fd)
++{
++    struct kgsl_device *kgsl_dev;
++    struct fd_device *dev;
++    struct kgsl_devinfo info;
++
++    /* Try to read the device info to detect if the FD is really KGSL */
++    if(kgsl_get_prop(fd, KGSL_PROP_DEVICE_INFO, &info, sizeof(info)))
++        return NULL;
++
++    kgsl_dev = calloc(1, sizeof(*kgsl_dev));
++    if (!kgsl_dev)
++      return NULL;
++
++    dev = &kgsl_dev->base;
++    dev->funcs = &funcs;
++    dev->fd = fd;
++    dev->version = FD_VERSION_ROBUSTNESS;
++    dev->features = FD_FEATURE_DIRECT_RESET | FD_FEATURE_IMPORT_DMABUF | FD_FEATURE_KGSL;
++
++    /* async submit_queue used for softpin deffered submits */
++    util_queue_init(&dev->submit_queue, "sq", 8, 1, 0, NULL);
++
++    dev->bo_size = sizeof(struct kgsl_bo);
++
++    return dev;
++}
++
++static void
++kgsl_device_destroy(struct fd_device *dev)
++{
++}
+diff --git a/src/freedreno/drm/kgsl/kgsl_pipe.c b/src/freedreno/drm/kgsl/kgsl_pipe.c
+new file mode 100644
+index 000000000000..4760212881dc
+--- /dev/null
++++ b/src/freedreno/drm/kgsl/kgsl_pipe.c
+@@ -0,0 +1,231 @@
++#include "kgsl_priv.h"
++#include "freedreno_ringbuffer_sp.h"
++
++/* TODO this function is borrowed from turnip, can it be shared in some way? */
++int
++kgsl_pipe_safe_ioctl(int fd, unsigned long request, void *arg)
++{
++   int ret;
++
++   do {
++      ret = ioctl(fd, request, arg);
++   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++
++   return ret;
++}
++
++/* TODO this function is borrowed from turnip, can it be shared in some way?
++ * safe_ioctl is not enough as restarted waits would not adjust the timeout
++ * which could lead to waiting substantially longer than requested
++ */
++static int
++wait_timestamp_safe(int fd,
++                    unsigned int context_id,
++                    unsigned int timestamp,
++                    int64_t timeout_ms)
++{
++   int64_t start_time = os_time_get_nano();
++   struct kgsl_device_waittimestamp_ctxtid wait = {
++      .context_id = context_id,
++      .timestamp = timestamp,
++      .timeout = timeout_ms,
++   };
++
++   while (true) {
++      int ret = kgsl_pipe_safe_ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
++
++      if (ret == -1 && (errno == EINTR || errno == EAGAIN)) {
++         int64_t current_time = os_time_get_nano();
++
++         /* update timeout to consider time that has passed since the start */
++         timeout_ms -= (current_time - start_time) / 1000000;
++         if (timeout_ms <= 0) {
++            errno = ETIME;
++            return -1;
++         }
++
++         wait.timeout = (unsigned int) timeout_ms;
++         start_time = current_time;
++      } else {
++         return ret;
++      }
++   }
++}
++
++int
++kgsl_get_prop(int fd, unsigned int type, void *value, size_t size)
++{
++   struct kgsl_device_getproperty getprop = {
++      .type = type,
++      .value = value,
++      .sizebytes = size,
++   };
++
++   return kgsl_pipe_safe_ioctl(fd, IOCTL_KGSL_DEVICE_GETPROPERTY, &getprop);
++}
++
++static int
++kgsl_pipe_get_param(struct fd_pipe *pipe, enum fd_param_id param,
++                    uint64_t *value)
++{
++   struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++   switch (param) {
++   case FD_DEVICE_ID:
++   case FD_GPU_ID:
++      *value = kgsl_pipe->dev_id.gpu_id;
++      return 0;
++   case FD_GMEM_SIZE:
++      *value = kgsl_pipe->gmem_size;
++      return 0;
++   case FD_GMEM_BASE:
++      *value = kgsl_pipe->gmem_base;
++      return 0;
++   case FD_CHIP_ID:
++      *value = kgsl_pipe->dev_id.chip_id;
++      return 0;
++   case FD_NR_PRIORITIES:
++      /* Take from kgsl kmd source code, if device is a4xx or newer
++       * it has KGSL_PRIORITY_MAX_RB_LEVELS=4 priorities otherwise it just has one.
++       * https://android.googlesource.com/kernel/msm/+/refs/tags/android-13.0.0_r0.21/drivers/gpu/msm/kgsl.h#56
++       */
++      *value = kgsl_pipe->dev_id.gpu_id >= 400 ? 4 : 1;
++      return 0;
++   case FD_MAX_FREQ:
++      /* Explicity fault on MAX_FREQ as we don't have a way to convert
++       * timestamp values from KGSL into time values. If we use the default
++       * path an error message would be generated when this is simply an
++       * unsupported feature.
++       */
++      return -1;
++   case FD_TIMESTAMP:
++      return -1;
++   case FD_UCHE_TRAP_BASE:
++      /* KGSL doesn't expose the UCHE trap base; return failure quietly so the
++       * gallium screen falls back to its built-in default (see
++       * freedreno_screen.c) instead of aborting device-info retrieval with a
++       * noisy "invalid param id" error. */
++      return -1;
++   default:
++      ERROR_MSG("invalid param id: %d", param);
++      return -1;
++   }
++}
++
++static int
++kgsl_pipe_set_param(struct fd_pipe *pipe, uint32_t param, uint64_t value)
++{
++    ERROR_MSG("kgsl_pipe_set_param not implemented");
++    return -1;
++}
++
++static int
++kgsl_pipe_wait(struct fd_pipe *pipe, const struct fd_fence *fence, uint64_t timeout)
++{
++    struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++    return wait_timestamp_safe(pipe->dev->fd, kgsl_pipe->queue_id, fence->kfence, timeout);
++}
++
++static void
++kgsl_pipe_destroy(struct fd_pipe *pipe)
++{
++    struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++    struct kgsl_drawctxt_destroy req = {
++        .drawctxt_id = kgsl_pipe->queue_id,
++    };
++
++    fd_pipe_sp_ringpool_fini(pipe);
++    kgsl_pipe_safe_ioctl(pipe->dev->fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &req);
++    free(kgsl_pipe);
++}
++
++static int
++kgsl_reset_status(struct fd_pipe *pipe, enum fd_reset_status *status)
++{
++    struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++    uint32_t value = kgsl_pipe->queue_id;
++    int ret = kgsl_get_prop(pipe->dev->fd, KGSL_PROP_GPU_RESET_STAT, &value, sizeof(value));
++
++    if (!ret) {
++        switch (value) {
++        case KGSL_CTX_STAT_NO_ERROR:
++            *status = FD_RESET_NO_ERROR;
++            break;
++        case KGSL_CTX_STAT_GUILTY_CONTEXT_RESET_EXT:
++            *status = FD_RESET_GUILTY;
++            break;
++        case KGSL_CTX_STAT_INNOCENT_CONTEXT_RESET_EXT:
++            *status = FD_RESET_INNOCENT;
++            break;
++        case KGSL_CTX_STAT_UNKNOWN_CONTEXT_RESET_EXT:
++        default:
++            *status = FD_RESET_UNKNOWN;
++            break;
++        }
++    }
++
++    return ret;
++}
++
++static const struct fd_pipe_funcs pipe_funcs = {
++    .ringbuffer_new_object = fd_ringbuffer_sp_new_object,
++    .submit_new = kgsl_submit_sp_new,
++    .reset_status = kgsl_reset_status,
++    .flush = fd_pipe_sp_flush,
++    .wait = kgsl_pipe_wait,
++    .get_param = kgsl_pipe_get_param,
++    .set_param = kgsl_pipe_set_param,
++    .destroy = kgsl_pipe_destroy,
++};
++
++struct fd_pipe *kgsl_pipe_new(struct fd_device *dev, enum fd_pipe_id id,
++                              uint32_t prio)
++{
++    struct kgsl_pipe *kgsl_pipe = NULL;
++    struct fd_pipe *pipe = NULL;
++    kgsl_pipe = calloc(1, sizeof(*kgsl_pipe));
++    if (!kgsl_pipe) {
++        ERROR_MSG("allocation failed");
++        goto fail;
++    }
++
++    pipe = &kgsl_pipe->base;
++    pipe->dev = dev;
++    pipe->funcs = &pipe_funcs;
++
++    struct kgsl_devinfo info;
++    if(kgsl_get_prop(dev->fd, KGSL_PROP_DEVICE_INFO, &info, sizeof(info)))
++        goto fail;
++
++    uint64_t gmem_iova;
++    if(kgsl_get_prop(dev->fd, KGSL_PROP_UCHE_GMEM_VADDR, &gmem_iova, sizeof(gmem_iova)))
++        goto fail;
++
++    kgsl_pipe->dev_id.gpu_id =
++        ((info.chip_id >> 24) & 0xff) * 100 +
++        ((info.chip_id >> 16) & 0xff) * 10 +
++        ((info.chip_id >>  8) & 0xff);
++
++    kgsl_pipe->dev_id.chip_id = info.chip_id;
++    kgsl_pipe->gmem_size = info.gmem_sizebytes;
++    kgsl_pipe->gmem_base = gmem_iova;
++
++    struct kgsl_drawctxt_create req = {
++        .flags = KGSL_CONTEXT_SAVE_GMEM |
++                 KGSL_CONTEXT_NO_GMEM_ALLOC |
++                 KGSL_CONTEXT_PREAMBLE,
++    };
++
++    int ret = kgsl_pipe_safe_ioctl(dev->fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
++    if(ret)
++        goto fail;
++
++    kgsl_pipe->queue_id = req.drawctxt_id;
++
++    fd_pipe_sp_ringpool_init(pipe);
++
++    return pipe;
++fail:
++    if (pipe)
++        fd_pipe_del(pipe);
++    return NULL;
++}
+diff --git a/src/freedreno/drm/kgsl/kgsl_priv.h b/src/freedreno/drm/kgsl/kgsl_priv.h
+new file mode 100644
+index 000000000000..ed9fc8061fc8
+--- /dev/null
++++ b/src/freedreno/drm/kgsl/kgsl_priv.h
+@@ -0,0 +1,60 @@
++#ifndef KGSL_PRIV_H
++#define KGSL_PRIV_H
++
++#ifndef __user
++#define __user
++#endif
++
++#include "freedreno_priv.h"
++
++/* TODO the KGSL kernel interface should probably be moved */
++/* into someplace common that both turnip and freedreno can use */
++#include "../../vulkan/msm_kgsl.h"
++
++int kgsl_get_prop(int fd, unsigned int type, void *value, size_t size);
++
++struct kgsl_device {
++    struct fd_device base;
++};
++FD_DEFINE_CAST(fd_device, kgsl_device);
++
++struct fd_device *kgsl_device_new(int fd);
++static void kgsl_device_destroy(struct fd_device *dev);
++
++struct kgsl_pipe {
++    struct fd_pipe base;
++
++    struct fd_dev_id dev_id;
++
++    uint32_t gmem_size;
++    uint64_t gmem_base;
++    uint32_t queue_id;
++};
++FD_DEFINE_CAST(fd_pipe, kgsl_pipe);
++
++struct fd_pipe *kgsl_pipe_new(struct fd_device *dev, enum fd_pipe_id id,
++                              uint32_t prio);
++int kgsl_pipe_safe_ioctl(int fd, unsigned long request, void *arg);
++struct fd_submit *kgsl_submit_sp_new(struct fd_pipe *pipe);
++
++struct kgsl_bo {
++    struct fd_bo base;
++    const char *name;
++    uint64_t iova;
++    uint32_t queue_id;
++    int import_fd; // fd for imported buffers
++
++    enum {
++        KGSL_BO_NATIVE,
++        KGSL_BO_IMPORT,
++    } bo_type;
++};
++FD_DEFINE_CAST(fd_bo, kgsl_bo);
++
++struct fd_bo *kgsl_bo_new(struct fd_device *dev, uint32_t size, uint32_t flags);
++struct fd_bo *kgsl_bo_from_dmabuf(struct fd_device *dev, int fd);
++struct fd_bo *kgsl_bo_from_handle(struct fd_device *dev, uint32_t size, uint32_t handle);
++void kgsl_bo_close_handle(struct fd_bo *bo);
++int kgsl_bo_wait_dmabuf(struct fd_bo *bo, uint32_t op);
++
++#endif
+diff --git a/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c b/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
+new file mode 100644
+index 000000000000..8af845b28ee3
+--- /dev/null
++++ b/src/freedreno/drm/kgsl/kgsl_ringbuffer_sp.c
+@@ -0,0 +1,148 @@
++#include "kgsl_priv.h"
++#include "freedreno_ringbuffer_sp.h"
++
++static int
++timestamp_to_fd(struct fd_pipe *pipe, uint32_t timestamp)
++{
++    int fd;
++    struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++    struct kgsl_timestamp_event event = {
++        .type = KGSL_TIMESTAMP_EVENT_FENCE,
++        .context_id = kgsl_pipe->queue_id,
++        .timestamp = timestamp,
++        .priv = &fd,
++        .len = sizeof(fd),
++    };
++
++    int ret = kgsl_pipe_safe_ioctl(pipe->dev->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event);
++    if (ret)
++        return -1;
++
++    return fd;
++}
++
++static int
++flush_submit_list(struct list_head *submit_list)
++{
++    struct fd_submit_sp *fd_submit = to_fd_submit_sp(last_submit(submit_list));
++    struct fd_pipe *pipe = fd_submit->base.pipe;
++    struct kgsl_pipe *kgsl_pipe = to_kgsl_pipe(pipe);
++    unsigned nr_cmds = 0;
++    int ret;
++
++    MESA_TRACE_FUNC();
++
++    foreach_submit (submit, submit_list) {
++        assert(submit->pipe == &kgsl_pipe->base);
++        nr_cmds += to_fd_ringbuffer_sp(submit->primary)->u.nr_cmds;
++    }
++
++    struct kgsl_command_object cmds[nr_cmds];
++    unsigned cmd_idx = 0;
++    foreach_submit_safe (submit, submit_list) {
++        struct fd_ringbuffer_sp *deferred_primary =
++            to_fd_ringbuffer_sp(submit->primary);
++
++        for (unsigned i = 0; i < deferred_primary->u.nr_cmds; i++) {
++            struct fd_bo *ring_bo = deferred_primary->u.cmds[i].ring_bo;
++
++            cmds[cmd_idx++] = (struct kgsl_command_object) {
++                .offset = 0,
++                .gpuaddr = ring_bo->iova + submit_offset(ring_bo, deferred_primary->offset),
++                .size = deferred_primary->u.cmds[i].size,
++                .flags = KGSL_CMDLIST_IB,
++                .id = ring_bo->handle,
++            };
++        }
++
++        if (submit == last_submit(submit_list)) {
++            DEBUG_MSG("merged %u submits", cmd_idx);
++            break;
++        }
++    }
++
++    if (fd_submit->wait_shared_bos) {
++        for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
++            struct fd_bo *bo = fd_submit->bos[i];
++            if (!fd_bo_may_be_shared(bo))
++                continue;
++
++            /* The BO table has no access flags. Wait for both readers and
++             * writers before submitting commands that use a shared BO.
++             */
++            ret = kgsl_bo_wait_dmabuf(bo, FD_BO_PREP_WRITE);
++            if (ret) {
++                ERROR_MSG("dma-buf wait failed (%s)", strerror(-ret));
++                goto out;
++            }
++        }
++    }
++
++    struct kgsl_cmd_syncpoint_fence sync_fence = {
++        .fd = fd_submit->in_fence_fd,
++    };
++
++    struct kgsl_command_syncpoint sync = {
++        .type = KGSL_CMD_SYNCPOINT_TYPE_FENCE,
++        .size = sizeof(sync_fence),
++        .priv = (uintptr_t) &sync_fence,
++    };
++
++
++    struct kgsl_gpu_command req = {
++        .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
++        .context_id = kgsl_pipe->queue_id,
++        .cmdlist = (uintptr_t) cmds,
++        .numcmds = cmd_idx,
++        .cmdsize = sizeof(struct kgsl_command_object),
++        .synclist = (uintptr_t) &sync,
++        .syncsize = sizeof(struct kgsl_command_syncpoint),
++        .numsyncs = sync_fence.fd != -1 ? 1 : 0,
++    };
++
++    ret = kgsl_pipe_safe_ioctl(pipe->dev->fd, IOCTL_KGSL_GPU_COMMAND, &req);
++
++    if (ret) {
++        ERROR_MSG("submit failed %d (%s)", ret, strerror(errno));
++        goto out;
++    }
++
++    fd_submit->out_fence->kfence = req.timestamp;
++
++    if (fd_submit->out_fence->use_fence_fd) {
++        int fd = timestamp_to_fd(pipe, req.timestamp);
++        if (fd < 0) {
++            ret = -errno;
++            ERROR_MSG("Failed to create sync file for timestamp (%s)", strerror(-ret));
++            goto out;
++        }
++
++        fd_submit->out_fence->fence_fd = fd;
++    }
++
++out:
++    if (fd_submit->in_fence_fd != -1) {
++        close(fd_submit->in_fence_fd);
++        fd_submit->in_fence_fd = -1;
++    }
++
++    /* Keep merged submits alive until KGSL has consumed the command list and,
++     * on success, populated the shared kernel timestamp.  Dropping them before
++     * IOCTL_KGSL_GPU_COMMAND can free BOs that the command stream still uses.
++     */
++    foreach_submit_safe (submit, submit_list) {
++        if (submit == last_submit(submit_list))
++            break;
++
++        list_del(&submit->node);
++        fd_submit_del(submit);
++    }
++
++    return ret;
++}
++
++struct fd_submit *
++kgsl_submit_sp_new(struct fd_pipe *pipe)
++{
++    return fd_submit_sp_new(pipe, flush_submit_list);
++}
+diff --git a/src/freedreno/drm/meson.build b/src/freedreno/drm/meson.build
+index 944ce8362172..994a3c6fe07e 100644
+--- a/src/freedreno/drm/meson.build
++++ b/src/freedreno/drm/meson.build
+@@ -65,6 +65,17 @@ if freedreno_kmds.contains('virtio')
+   libfreedreno_drm_link_with += libvdrm
+ endif
+ 
++libfreedreno_kgsl_files = files(
++  'kgsl/kgsl_device.c',
++  'kgsl/kgsl_bo.c',
++  'kgsl/kgsl_pipe.c',
++  'kgsl/kgsl_ringbuffer_sp.c',
++)
++
++if freedreno_kmds.contains('kgsl')
++  libfreedreno_drm_files += libfreedreno_kgsl_files
++endif
++
+ libfreedreno_drm = static_library(
+   'freedreno_drm',
+   [
+@@ -79,3 +90,16 @@ libfreedreno_drm = static_library(
+   build_by_default : false,
+ )
+ 
++if with_tests and freedreno_kmds.contains('kgsl')
++  test(
++    'kgsl_bo_handle',
++    executable(
++      'kgsl_bo_handle_test',
++      ['tests/kgsl_bo_handle_test.c', freedreno_xml_header_files],
++      include_directories : libfreedreno_drm_includes,
++      dependencies : [libfreedreno_drm_deps, idep_libfreedreno_common],
++      link_with : libfreedreno_drm,
++    ),
++    suite : ['freedreno'],
++  )
++endif
+diff --git a/src/freedreno/vulkan/tu_wsi.cc b/src/freedreno/vulkan/tu_wsi.cc
+index 4db6d5e1346a..22a998698358 100644
+--- a/src/freedreno/vulkan/tu_wsi.cc
++++ b/src/freedreno/vulkan/tu_wsi.cc
+@@ -15,6 +15,17 @@
+ 
+ #include "tu_device.h"
+ 
++#include <string.h>
++
++#include "util/u_debug.h"
++
++static bool
++tu_wsi_is_kgsl(const struct tu_physical_device *pdevice)
++{
++   return pdevice->instance->knl &&
++          strcmp(pdevice->instance->knl->name, "kgsl") == 0;
++}
++
+ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ tu_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+ {
+@@ -27,6 +38,11 @@ tu_wsi_can_present_on_device(VkPhysicalDevice physicalDevice, int fd)
+ {
+ #ifdef HAVE_LIBDRM
+    VK_FROM_HANDLE(tu_physical_device, pdevice, physicalDevice);
++   const bool is_kgsl = tu_wsi_is_kgsl(pdevice);
++
++   if (is_kgsl)
++      return true;
++
+    return wsi_common_drm_devices_equal(fd, pdevice->local_fd);
+ #else
+    return true;
+@@ -53,6 +69,15 @@ tu_wsi_init(struct tu_physical_device *physical_device)
+    physical_device->wsi_device.can_present_on_device =
+       tu_wsi_can_present_on_device;
+ 
++   /* kgsl puts no fence on a dma-buf, so the X server cannot wait for the
++    * GPU before it reads a presented image. Have the X11 WSI wait in every
++    * present mode, as it already does for mailbox.
++    * MESA_DRI3_DISABLE_PRESENT_WAIT_FENCE=1 turns this off.
++    */
++   physical_device->wsi_device.x11.wait_for_fences =
++      tu_wsi_is_kgsl(physical_device) &&
++      !debug_get_bool_option("MESA_DRI3_DISABLE_PRESENT_WAIT_FENCE", false);
++
+    physical_device->vk.wsi_device = &physical_device->wsi_device;
+ 
+    return VK_SUCCESS;
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+index d9840c079624..078458f9799b 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -8,6 +8,8 @@
+  */
+ 
+ #include "pipe/p_state.h"
++#include <stdio.h>
++#include <stdlib.h>
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
+ #include "util/u_string.h"
+@@ -328,6 +330,12 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+    struct fd6_context *fd6_ctx = fd6_context(ctx);
+    struct fd6_emit emit;
+ 
++   if (getenv("DMD_VA_PROBE"))
++      fprintf(stderr, "tva-fd draw mode=%u prim=%u count=%u start=%u vs=%p fs=%p\n",
++              info->mode, ctx->screen->primtypes[info->mode],
++              draws ? draws[0].count : 0, draws ? draws[0].start : 0,
++              ctx->prog.vs, ctx->prog.fs);
++
+    emit.ctx = ctx;
+    emit.info = info;
+    emit.indirect = indirect;
+@@ -341,8 +349,11 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+    emit.prog = NULL;
+    emit.draw_id = 0;
+ 
+-   if (!(ctx->prog.vs && ctx->prog.fs))
++   if (!(ctx->prog.vs && ctx->prog.fs)) {
++      if (getenv("DMD_VA_PROBE"))
++         fprintf(stderr, "tva-fd draw skipped: missing shader\n");
+       return;
++   }
+ 
+    if (PIPELINE == HAS_TESS_GS) {
+       if ((info->mode == MESA_PRIM_PATCHES) || ctx->prog.gs) {
+@@ -366,8 +377,11 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+    }
+ 
+    /* bail if compile failed: */
+-   if (!emit.prog)
++   if (!emit.prog) {
++      if (getenv("DMD_VA_PROBE"))
++         fprintf(stderr, "tva-fd draw skipped: program lookup failed\n");
+       return;
++   }
+ 
+    fixup_draw_state(ctx, &emit);
+ 
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc b/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
+index 3b589568e263..c94b8a80c21a 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
+@@ -14,7 +14,12 @@
+ #include "util/u_memory.h"
+ #include "util/u_string.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++
+ #include "freedreno_dev_info.h"
++#include "fd6_barrier.h"
+ #include "fd6_emit.h"
+ #include "fd6_resource.h"
+ #include "fd6_screen.h"
+@@ -561,6 +566,21 @@ fd6_sampler_view_update(struct fd_context *ctx,
+                            ctx->screen->info->props.has_z24uint_s8uint);
+       memcpy(so->descriptor, view.descriptor, sizeof(so->descriptor));
+    }
++
++   if (getenv("DMD_VA_PROBE") &&
++       (format == PIPE_FORMAT_R8_UNORM ||
++        format == PIPE_FORMAT_B8G8R8A8_UNORM)) {
++      fprintf(stderr,
++              "tva-fd sampler res=%p shared=%d fmt=%s bo=%u iova=%#llx "
++              "layout=%#x pitch=%u size=%llu desc=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
++              (void *)prsc, rsc->b.is_shared, util_format_short_name(format),
++              fd_bo_handle(rsc->bo), (unsigned long long)fd_bo_get_iova(rsc->bo),
++              rsc->layout.slices[0].offset, rsc->layout.pitch0,
++              (unsigned long long)rsc->layout.size,
++              so->descriptor[0], so->descriptor[1], so->descriptor[2],
++              so->descriptor[3], so->descriptor[4], so->descriptor[5],
++              so->descriptor[6], so->descriptor[7]);
++   }
+ }
+ 
+ template <chip CHIP>
+@@ -580,7 +600,7 @@ fd6_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
+       return;
+ 
+    for (unsigned i = 0; i < nr; i++) {
+-      struct fd6_pipe_sampler_view *so = fd6_pipe_sampler_view(views[i + start]);
++      struct fd6_pipe_sampler_view *so = fd6_pipe_sampler_view(views[i]);
+ 
+       if (!so)
+          continue;
+@@ -817,6 +837,93 @@ fd6_texture_state(struct fd_context *ctx, mesa_shader_stage type)
+    struct fd6_texture_state *state = NULL;
+    struct fd6_texture_key key;
+ 
++   /* EGL/DRI dma-buf imports are shared with an external producer (the
++    * termux-va bridge).  The producer can update the BO without touching this
++    * context's resource sequence number or submitting a Gallium batch.  Make
++    * the consumer invalidate its texture cache immediately before the draw;
++    * this is deliberately keyed to shared resources so ordinary textures do
++    * not pay the extra barrier. */
++   bool shared_texture = false;
++   for (unsigned i = 0; i < tex->num_textures; i++) {
++      if (tex->textures[i] &&
++          fd_resource(tex->textures[i]->texture)->b.is_shared) {
++         shared_texture = true;
++         break;
++      }
++   }
++   if (getenv("DMD_VA_PROBE") && tex->num_textures) {
++      for (unsigned i = 0; i < tex->num_textures; i++) {
++         if (!tex->textures[i])
++            continue;
++         struct fd_resource *rsc =
++            fd_resource(tex->textures[i]->texture);
++         fprintf(stderr, "tva-fd texture state stage=%d slot=%u res=%p "
++                 "shared=%d bo=%u format=%s\n", type, i,
++                 (void *)tex->textures[i]->texture, rsc->b.is_shared,
++                 rsc->bo ? fd_bo_handle(rsc->bo) : 0,
++                 util_format_short_name(tex->textures[i]->format));
++      }
++   }
++   const char *bo_sync_env = getenv("DMD_VA_BO_SYNC");
++   const bool bo_sync = !bo_sync_env ||
++                        (strcmp(bo_sync_env, "0") != 0 &&
++                         strcmp(bo_sync_env, "false") != 0 &&
++                         strcmp(bo_sync_env, "off") != 0);
++   const char *sync_every_env = getenv("DMD_VA_SYNC_EVERY_DRAW");
++   const bool sync_every_draw = sync_every_env &&
++                                (strcmp(sync_every_env, "1") == 0 ||
++                                 strcmp(sync_every_env, "true") == 0 ||
++                                 strcmp(sync_every_env, "on") == 0);
++   bool external_barrier = false;
++   if (shared_texture || getenv("DMD_VA_SYNC_ALL") || sync_every_draw) {
++      for (unsigned i = 0; i < tex->num_textures; i++) {
++         if (!tex->textures[i])
++            continue;
++
++         struct fd_resource *rsc =
++            fd_resource(tex->textures[i]->texture);
++         if (!rsc->b.is_shared && !getenv("DMD_VA_SYNC_ALL") &&
++             !sync_every_draw)
++            continue;
++
++         fd_resource_lock(rsc);
++         const bool need_handoff = sync_every_draw ||
++                                   !rsc->tva_external_sync_valid;
++         const bool need_barrier = need_handoff ||
++                                   rsc->tva_external_barrier_pending;
++         if (need_barrier)
++            rsc->tva_external_barrier_pending = false;
++         fd_resource_unlock(rsc);
++         external_barrier |= need_barrier;
++         if (!need_handoff)
++            continue;
++
++         int ret = bo_sync ? fd_bo_sync_to_gpu(rsc->bo) : 0;
++         if (ret == 0) {
++            fd_resource_lock(rsc);
++            rsc->tva_external_sync_valid = true;
++            fd_resource_unlock(rsc);
++         } else if (getenv("DMD_VA_LOG")) {
++            fprintf(stderr, "tva-fd GPUOBJ_SYNC failed res=%p bo=%p errno=%d\n",
++                    (void *)rsc, (void *)rsc->bo, errno);
++         }
++      }
++
++      if (external_barrier) {
++         const unsigned external_flushes = FD6_INVALIDATE_CACHE |
++                                           FD6_FLUSH_CACHE |
++                                           FD6_WAIT_MEM_WRITES;
++         if (ctx->batch)
++            ctx->batch->barrier |= external_flushes;
++         if (ctx->batch_nondraw)
++            ctx->batch_nondraw->barrier |= external_flushes;
++         if (getenv("DMD_VA_LOG"))
++            fprintf(stderr, "tva-fd shared texture stage=%d batch=%p barrier=%#x\n",
++                    type, (void *)ctx->batch,
++                    ctx->batch ? ctx->batch->barrier : 0);
++      }
++   }
++
+    if (unlikely(fd6_ctx->tex_cache_needs_invalidate))
+       handle_invalidates<CHIP>(ctx);
+ 
+@@ -829,6 +936,11 @@ fd6_texture_state(struct fd_context *ctx, mesa_shader_stage type)
+       struct fd6_pipe_sampler_view *view =
+          fd6_pipe_sampler_view(tex->textures[i]);
+ 
++      /* A resource's backing storage can change while this sampler view
++       * stays bound. Refresh its descriptor and invalidate the
++       * old cache entries before looking up the texture state by view ID. */
++      fd6_sampler_view_update<CHIP>(ctx, view);
++
+       key.view_seqno[i] = view->seqno;
+    }
+ 
+@@ -906,6 +1018,19 @@ fd6_rebind_resource(struct fd_context *ctx, struct fd_resource *rsc) assert_dt
+ 
+    struct fd6_context *fd6_ctx = fd6_context(ctx);
+ 
++   /* A dma-buf may have been written by another GPU/CPU context without a
++    * BO rebind.  Rebuilding the sampler state is not enough: invalidate the
++    * consumer-side texture cache before the next draw that uses this
++    * resource.  The barrier is attached to whichever batch is active; the
++    * normal state emission path will consume it before issuing the draw. */
++   const unsigned external_flushes = FD6_INVALIDATE_CACHE |
++                                     FD6_FLUSH_CACHE |
++                                     FD6_WAIT_MEM_WRITES;
++   if (ctx->batch)
++      ctx->batch->barrier |= external_flushes;
++   if (ctx->batch_nondraw)
++      ctx->batch_nondraw->barrier |= external_flushes;
++
+    hash_table_foreach (fd6_ctx->tex_cache, entry) {
+       struct fd6_texture_state *state = (struct fd6_texture_state *)entry->data;
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_batch.c b/src/gallium/drivers/freedreno/freedreno_batch.c
+index 5f1a5dfe8373..14162a99ee6a 100644
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -386,6 +386,14 @@ batch_flush(struct fd_batch *batch, bool last_batch)
+    if (last_batch && !batch->fence)
+       batch->fence = fd_pipe_fence_create(batch);
+ 
++   /* flush_resource() can submit the drawable's writer before the frontend's
++    * context flush reaches fd_context_flush().  Mark that writer's fence for
++    * native-fd export here so the Present fence still comes from the rendering
++    * submission rather than a following empty submit.
++    */
++   if (last_batch && batch->ctx->explicit_present_fence && batch->fence)
++      batch->fence->use_fence_fd = true;
++
+    if (batch->fence)
+       fd_pipe_fence_ref(&batch->ctx->last_fence, batch->fence);
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_context.c b/src/gallium/drivers/freedreno/freedreno_context.c
+index e642299ba9c7..e2291d24d4c5 100644
+--- a/src/gallium/drivers/freedreno/freedreno_context.c
++++ b/src/gallium/drivers/freedreno/freedreno_context.c
+@@ -44,6 +44,7 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
+       fd_bc_dump(ctx, "need fence, last_fence=%p", ctx->last_fence);
+       batch = fd_context_batch(ctx);
+    } else if (!batch) {
++      ctx->explicit_present_fence = false;
+       return;
+    }
+ 
+@@ -118,6 +119,8 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
+    fd_bc_dump(ctx, "%p: remaining:\n", ctx);
+ 
+ out:
++   ctx->explicit_present_fence = false;
++
+    if (fencep)
+       fd_pipe_fence_ref(fencep, fence);
+ 
+@@ -134,6 +137,24 @@ fd_context_flush(struct pipe_context *pctx, struct pipe_fence_handle **fencep,
+       assert(pctx->get_device_reset_status(pctx) == PIPE_NO_RESET);
+ }
+ 
++static void
++fd_set_context_param(struct pipe_context *pctx, enum pipe_context_param param,
++                     unsigned value)
++{
++   struct fd_context *ctx = fd_context(pctx);
++
++   switch (param) {
++   case PIPE_CONTEXT_PARAM_EXPLICIT_PRESENT_FENCE:
++      ctx->explicit_present_fence = value;
++      break;
++   case PIPE_CONTEXT_PARAM_DISABLE_PRESENT_WAIT_FENCE:
++      ctx->disable_present_wait_fence = value;
++      break;
++   default:
++      break;
++   }
++}
++
+ static void
+ fd_texture_barrier(struct pipe_context *pctx, unsigned flags) in_dt
+ {
+@@ -504,6 +525,22 @@ fd_get_device_reset_status(struct pipe_context *pctx)
+    return status;
+ }
+ 
++static enum pipe_reset_status
++fd_get_device_reset_status_direct(struct pipe_context *pctx)
++{
++   struct fd_context *ctx = fd_context(pctx);
++   enum pipe_reset_status status_list[] = {
++      [FD_RESET_NO_ERROR] = PIPE_NO_RESET,
++      [FD_RESET_GUILTY] = PIPE_GUILTY_CONTEXT_RESET,
++      [FD_RESET_INNOCENT] = PIPE_INNOCENT_CONTEXT_RESET,
++      [FD_RESET_UNKNOWN] = PIPE_UNKNOWN_CONTEXT_RESET,
++   };
++   enum fd_reset_status fd_status;
++   ASSERTED int ret = fd_pipe_get_reset_status(ctx->pipe, &fd_status);
++   assert(!ret);
++   return status_list[fd_status];
++}
++
+ static bool
+ fd_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
+                    uint64_t offset_B, uint32_t flags)
+@@ -671,11 +708,6 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
+ 
+    ctx->in_fence_fd = -1;
+ 
+-   if (fd_device_version(screen->dev) >= FD_VERSION_ROBUSTNESS) {
+-      ctx->context_reset_count = fd_get_reset_count(ctx, true);
+-      ctx->global_reset_count = fd_get_reset_count(ctx, false);
+-   }
+-
+    simple_mtx_init(&ctx->gmem_lock, mtx_plain);
+ 
+    /* need some sane default in case gallium frontends don't
+@@ -688,15 +720,23 @@ fd_context_init(struct fd_context *ctx, struct pipe_screen *pscreen,
+    pctx->screen = pscreen;
+    pctx->priv = priv;
+    pctx->flush = fd_context_flush;
++   pctx->set_context_param = fd_set_context_param;
+    pctx->emit_string_marker = fd_emit_string_marker;
+    pctx->set_debug_callback = fd_set_debug_callback;
+-   pctx->get_device_reset_status = fd_get_device_reset_status;
+    pctx->create_fence_fd = fd_create_pipe_fence_fd;
+    pctx->fence_server_sync = fd_pipe_fence_server_sync;
+    pctx->fence_server_signal = fd_pipe_fence_server_signal;
+    pctx->texture_barrier = fd_texture_barrier;
+    pctx->memory_barrier = fd_memory_barrier;
+ 
++   if (fd_get_features(screen->dev) & FD_FEATURE_DIRECT_RESET) {
++      pctx->get_device_reset_status = fd_get_device_reset_status_direct;
++   } else if(fd_device_version(screen->dev) >= FD_VERSION_ROBUSTNESS) {
++      ctx->context_reset_count = fd_get_reset_count(ctx, true);
++      ctx->global_reset_count = fd_get_reset_count(ctx, false);
++      pctx->get_device_reset_status = fd_get_device_reset_status;
++   }
++
+    pctx->stream_uploader = u_upload_create_default(pctx);
+    if (!pctx->stream_uploader)
+       goto fail;
+diff --git a/src/gallium/drivers/freedreno/freedreno_context.h b/src/gallium/drivers/freedreno/freedreno_context.h
+index 79529aac2e72..92bf6b9ebcb4 100644
+--- a/src/gallium/drivers/freedreno/freedreno_context.h
++++ b/src/gallium/drivers/freedreno/freedreno_context.h
+@@ -358,6 +358,12 @@ struct fd_context {
+     */
+    struct pipe_fence_handle *last_fence dt;
+ 
++   /* The next context flush exports the render-completion fence directly to
++    * the window-system presentation path.
++    */
++   bool explicit_present_fence;
++   bool disable_present_wait_fence;
++
+    /*
+     * Counter to keep track of batch's most recent update.  Ie. the batch with
+     * the higher update count is the one that has been drawn/etc to the most
+diff --git a/src/gallium/drivers/freedreno/freedreno_fence.c b/src/gallium/drivers/freedreno/freedreno_fence.c
+index c40940e2631d..3b0769018c2e 100644
+--- a/src/gallium/drivers/freedreno/freedreno_fence.c
++++ b/src/gallium/drivers/freedreno/freedreno_fence.c
+@@ -144,6 +144,16 @@ fd_pipe_fence_finish(struct pipe_screen *pscreen, struct pipe_context *pctx,
+ 
+    if (fence->use_fence_fd) {
+       assert(fence->fence);
++      /* Locally submitted fences also have a GPU-written completion marker.
++       * Check it before waiting for the kernel's sync-file notification, as
++       * fence signaling can lag behind completion of the command stream.
++       * Imported fences have no userspace sequence number. A wrapped zero
++       * sequence simply takes the existing sync-file path as well.
++       */
++      if (fence->fence->ufence &&
++          !fd_pipe_wait_timeout(fence->pipe, fence->fence, 0))
++         return true;
++
+       int ret = sync_wait(fence->fence->fence_fd, timeout / 1000000);
+       return ret == 0;
+    }
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index 29134ba1337c..6abf4270bbe2 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -30,6 +30,12 @@
+ #include "freedreno_util.h"
+ 
+ #include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ #include "drm-uapi/drm_fourcc.h"
+ 
+ /* XXX this should go away, needed for 'struct winsys_handle' */
+@@ -157,11 +163,65 @@ rebind_resource(struct fd_resource *rsc) assert_dt
+    fd_screen_unlock(screen);
+ }
+ 
++/*
++ * External producers (for example a VA decoder writing a shared dma-buf)
++ * can update the backing BO without changing the BO handle or the resource
++ * sequence number.  Gallium's external-image paths call resource_changed()
++ * in that situation so the driver can invalidate any derived texture state.
++ * Freedreno normally reaches this path when a resource is reallocated; make
++ * the same cache invalidation explicit for imported resources as well.
++ */
++static void
++fd_resource_changed(struct pipe_screen *pscreen, struct pipe_resource *prsc) assert_dt
++{
++   (void)pscreen;
++   if (!prsc)
++      return;
++
++   if (getenv("DMD_VA_LOG"))
++      fprintf(stderr, "tva-fd resource_changed res=%p fmt=%d %ux%u\n",
++              (void *)prsc, prsc->format, prsc->width0, prsc->height0);
++
++   struct fd_resource *rsc = fd_resource(prsc);
++   fd_resource_lock(rsc);
++   rsc->tva_external_sync_valid = false;
++   rsc->tva_external_barrier_pending = true;
++   fd_resource_unlock(rsc);
++
++   /* The termux-va bridge writes a stable linear imported resource in place.
++    * Its sampler descriptor does not change between frames, so invalidate
++    * only the external cache handoff instead of rebuilding every shader
++    * state object on each frame.  Keep the normal rebind path for all other
++    * external-image users. */
++   const char *bridge_env = getenv("TERMUX_VA_BRIDGE");
++   const bool tva_in_place = rsc->b.is_shared && bridge_env &&
++                             strcmp(bridge_env, "0") != 0 &&
++                             strcmp(bridge_env, "false") != 0 &&
++                             strcmp(bridge_env, "off") != 0;
++   if (!tva_in_place) {
++      fd_resource_set_usage(prsc, FD_DIRTY_TEX);
++      rebind_resource(rsc);
++   }
++
++   /* A lowered multi-plane import is represented by a linked resource chain;
++    * invalidate each plane's cached texture state when the external producer
++    * publishes a new frame. */
++   if (prsc->next)
++      fd_resource_changed(pscreen, prsc->next);
++}
++
+ static inline void
+ fd_resource_set_bo(struct fd_resource *rsc, struct fd_bo *bo)
+ {
+    struct fd_screen *screen = fd_screen(rsc->b.b.screen);
+ 
++   if (getenv("DMD_VA_PROBE") &&
++       (rsc->b.is_shared || (bo && (bo->alloc_flags & FD_BO_SHARED))))
++      fprintf(stderr, "tva-fd set_bo pid=%d res=%p old=%u new=%u shared=%d\n",
++              (int)getpid(), (void *)rsc,
++              rsc->bo ? rsc->bo->handle : 0,
++              bo ? bo->handle : 0, rsc->b.is_shared);
++
+    rsc->bo = bo;
+    rsc->seqno = seqno_next_u16(&screen->rsc_seqno);
+ }
+@@ -425,6 +485,13 @@ fd_try_shadow_resource(struct fd_context *ctx, struct fd_resource *rsc,
+     */
+    struct fd_resource *shadow = fd_resource(pshadow);
+ 
++   if (getenv("DMD_VA_PROBE"))
++      fprintf(stderr, "tva-fd shadow pid=%d res=%p old=%u shadow=%p new=%u shared=%d/%d modifier=%" PRIx64 "\n",
++              (int)getpid(), (void *)rsc,
++              rsc->bo ? rsc->bo->handle : 0, (void *)shadow,
++              shadow->bo ? shadow->bo->handle : 0,
++              rsc->b.is_shared, shadow->b.is_shared, modifier);
++
+    DBG("shadow: %p (%d, %p) -> %p (%d, %p)", rsc, rsc->b.b.reference.count,
+        rsc->track, shadow, shadow->b.b.reference.count, shadow->track);
+ 
+@@ -689,7 +756,7 @@ fd_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+     * to the kernel for the fence to be added to the backing GEM
+     * object.
+     */
+-   if (ctx->no_implicit_sync)
++   if (ctx->no_implicit_sync && !ctx->screen->is_kgsl)
+       return;
+ 
+    flush_resource(ctx, rsc, PIPE_MAP_READ);
+@@ -698,6 +765,17 @@ fd_flush_resource(struct pipe_context *pctx, struct pipe_resource *prsc)
+     * way to the kernel:
+     */
+    fd_resource_wait(ctx, rsc, FD_BO_PREP_FLUSH);
++
++   /* KGSL does not attach Mesa's tracked render fence to an exported dma-buf.
++    * If the window-system path is not carrying the next submission's native
++    * fence explicitly, wait here before handing the resource to an
++    * implicit-sync consumer.  The explicit Present-fence path avoids this
++    * per-frame CPU stall. The compatibility opt-out restores the previous
++    * window-system behavior without changing resource submission or API fences.
++    */
++   if (ctx->screen->is_kgsl && !ctx->explicit_present_fence &&
++       !ctx->disable_present_wait_fence)
++      fd_resource_wait(ctx, rsc, FD_BO_PREP_READ);
+ }
+ 
+ static void
+@@ -709,15 +787,36 @@ fd_resource_transfer_unmap(struct pipe_context *pctx,
+    struct fd_resource *rsc = fd_resource(ptrans->resource);
+    struct fd_transfer *trans = fd_transfer(ptrans);
+ 
++   if (getenv("DMD_VA_PROBE"))
++      fprintf(stderr, "tva-fd unmap res=%p bo=%u shared=%d usage=%#x staging=%p upload=%p\n",
++              (void *)ptrans->resource, rsc->bo ? rsc->bo->handle : 0,
++              rsc->b.is_shared,
++              ptrans->usage, (void *)trans->staging_prsc,
++              trans->upload_ptr);
++
+    if (trans->staging_prsc) {
+-      if (ptrans->usage & PIPE_MAP_WRITE)
++      if (ptrans->usage & PIPE_MAP_WRITE) {
++         /* The CPU has just populated the staging BO.  KGSL does not provide
++          * implicit cache maintenance for this CPU-to-GPU handoff, so clean
++          * it before the blit reads the staging contents. */
++         fd_bo_sync_to_gpu(fd_resource(trans->staging_prsc)->bo);
+          fd_blit_from_staging(ctx, trans);
++      }
+       pipe_resource_reference(&trans->staging_prsc, NULL);
+    }
+ 
+    if (trans->upload_ptr) {
+       fd_bo_upload(rsc->bo, trans->upload_ptr, ptrans->box.x, ptrans->box.width);
++      fd_bo_sync_to_gpu(rsc->bo);
+       free(trans->upload_ptr);
++   } else if (ptrans->usage & PIPE_MAP_WRITE) {
++      /* Direct maps and upload-manager maps write the BO from the CPU. */
++      fd_bo_sync_to_gpu(rsc->bo);
++   } else if (ptrans->usage & PIPE_MAP_READ) {
++      /* Complete the GPU-to-dma-buf transition after a shared resource has
++       * been observed by the CPU.  This is needed by KGSL consumers that
++       * import the same dma-buf in a separate GPU context. */
++      fd_bo_sync_to_gpu(rsc->bo);
+    }
+ 
+    util_range_add(&rsc->b.b, &rsc->valid_buffer_range, ptrans->box.x,
+@@ -954,6 +1053,15 @@ resource_transfer_map(struct pipe_context *pctx, struct pipe_resource *prsc,
+          if (ret)
+             return NULL;
+       }
++
++      /* A shared resource may have just been written by a GPU producer in a
++       * different API context (for example the VA compositor).  KGSL does not
++       * provide an implicit dma-buf cache transition for that handoff.  Flush
++       * the producer's cache before exposing the resource to a CPU mapping;
++       * this also makes the completed contents visible to a subsequent GPU
++       * import in another context. */
++      if ((usage & PIPE_MAP_READ) && rsc->b.is_shared)
++         fd_bo_sync_to_gpu(rsc->bo);
+    }
+ 
+    return resource_transfer_map_unsync(pctx, prsc, level, usage, box, trans);
+@@ -1075,6 +1183,15 @@ fd_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
+ static uint64_t
+ fd_resource_modifier(struct fd_resource *rsc)
+ {
++   struct fd_screen *screen = fd_screen(rsc->b.b.screen);
++
++   if (screen->kgsl_dmabuf) {
++      if (rsc->layout.tile_mode == 0 && !rsc->layout.ubwc_layer_size)
++         return DRM_FORMAT_MOD_LINEAR;
++
++      return DRM_FORMAT_MOD_INVALID;
++   }
++
+    if (rsc->layout.ubwc_layer_size)
+       return DRM_FORMAT_MOD_QCOM_COMPRESSED;
+ 
+@@ -1092,7 +1209,16 @@ fd_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx,
+                        unsigned usage)
+    assert_dt
+ {
++   /* Planar DRI images store their planes in a resource chain. Match the
++    * plane selection used by resource_get_param, including FD exports. */
++   prsc = util_resource_at_index(prsc, handle->plane);
++   if (!prsc)
++      return false;
+    struct fd_resource *rsc = fd_resource(prsc);
++   /* Keep track of resources imported from an external handle.  The
++    * is_shared bit is also set when a newly allocated resource is exported,
++    * so it must be sampled before this function marks the resource shared. */
++   const bool imported = rsc->b.is_shared;
+ 
+    rsc->b.is_shared = true;
+ 
+@@ -1101,6 +1227,26 @@ fd_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx,
+ 
+    handle->modifier = fd_resource_modifier(rsc);
+ 
++   if (fd_screen(pscreen)->kgsl_dmabuf) {
++      handle->modifier = DRM_FORMAT_MOD_LINEAR;
++
++      if (!(prsc->bind & PIPE_BIND_SHARED)) {
++         /* Preserve the shared binding for callers which cache the resource
++          * usage, but never replace storage that was imported from an
++          * external dma-buf. */
++         prsc->bind |= PIPE_BIND_SHARED;
++
++         if (!imported) {
++            struct fd_context *ctx = fd_screen_aux_context_get(pscreen);
++            bool ret = fd_try_shadow_resource(ctx, rsc, 0, NULL,
++                                              handle->modifier);
++            fd_screen_aux_context_put(pscreen);
++            if (!ret)
++               return false;
++         }
++      }
++   }
++
+    if (prsc->target != PIPE_BUFFER) {
+       struct fdl_metadata metadata = {
+          .modifier = handle->modifier,
+@@ -1112,8 +1258,10 @@ fd_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx,
+ 
+    bool ret = fd_screen_bo_get_handle(pscreen, rsc->bo, rsc->scanout,
+                                       fd_resource_pitch(rsc, 0), handle);
++   if (ret)
++      handle->offset = fd_resource_offset(rsc, 0, handle->layer);
+ 
+-   if (!ret && !(prsc->bind & PIPE_BIND_SHARED)) {
++   if (!ret && !imported && !(prsc->bind & PIPE_BIND_SHARED)) {
+ 
+       pctx = threaded_context_unwrap_sync(pctx);
+ 
+@@ -1304,6 +1452,20 @@ get_best_layout(struct fd_screen *screen,
+    if (FD_DBG(NOTILE))
+        return FD_LAYOUT_LINEAR;
+ 
++   if (screen->kgsl_dmabuf &&
++       (tmpl->bind & (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT))) {
++      if (has_implicit_modifier(modifiers, count) ||
++          drm_find_modifier(DRM_FORMAT_MOD_LINEAR, modifiers, count)) {
++         perf_debug("%" PRSC_FMT ": forcing linear: kgsl shared/scanout resource",
++                    PRSC_ARGS(tmpl));
++         return FD_LAYOUT_LINEAR;
++      }
++
++      perf_debug("%" PRSC_FMT ": kgsl shared/scanout resource requires linear",
++                 PRSC_ARGS(tmpl));
++      return FD_LAYOUT_ERROR;
++   }
++
+    /* Shared resources without explicit modifiers must always be linear */
+    if (!can_explicit && (tmpl->bind & PIPE_BIND_SHARED)) {
+       perf_debug("%" PRSC_FMT
+@@ -1580,6 +1742,15 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
+ 
+    DBG("%" PRSC_FMT ", modifier=%" PRIx64, PRSC_ARGS(prsc), handle->modifier);
+ 
++   if (screen->kgsl_dmabuf &&
++       handle->modifier != DRM_FORMAT_MOD_LINEAR &&
++       handle->modifier != DRM_FORMAT_MOD_INVALID) {
++      if (FD_DBG(LAYOUT))
++         mesa_loge("kgsl cannot import non-linear modifier %" PRIx64,
++                   handle->modifier);
++      goto fail;
++   }
++
+    rsc->b.is_shared = true;
+ 
+    struct fd_bo *bo = fd_screen_bo_from_handle(pscreen, handle);
+@@ -1589,6 +1760,25 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
+       goto fail;
+    }
+ 
++   if (getenv("DMD_VA_PROBE") && handle->type == WINSYS_HANDLE_TYPE_FD) {
++      struct stat st;
++      if (fstat((int)handle->handle, &st) == 0)
++         fprintf(stderr, "tva-fd import res=%p fd=%d dev=%ju ino=%ju bo=%u "
++                 "fmt=%s %ux%u stride=%u offset=%u shared=%d\n",
++                 (void *)rsc, (int)handle->handle,
++                 (uintmax_t)st.st_dev, (uintmax_t)st.st_ino,
++                 fd_bo_handle(bo), util_format_short_name(tmpl->format),
++                 tmpl->width0, tmpl->height0, handle->stride, handle->offset,
++                 rsc->b.is_shared);
++      else
++         fprintf(stderr, "tva-fd import res=%p fd=%d fstat errno=%d bo=%u "
++                 "fmt=%s %ux%u stride=%u offset=%u shared=%d\n",
++                 (void *)rsc, (int)handle->handle, errno, fd_bo_handle(bo),
++                 util_format_short_name(tmpl->format), tmpl->width0,
++                 tmpl->height0, handle->stride, handle->offset,
++                 rsc->b.is_shared);
++   }
++
+    fd_resource_set_bo(rsc, bo);
+ 
+    rsc->internal_format = tmpl->format;
+@@ -1861,6 +2051,7 @@ fd_resource_screen_init(struct pipe_screen *pscreen)
+    pscreen->resource_from_handle = fd_resource_from_handle;
+    pscreen->resource_get_handle = fd_resource_get_handle;
+    pscreen->resource_get_param = fd_resource_get_param;
++   pscreen->resource_changed = fd_resource_changed;
+    pscreen->resource_destroy = u_transfer_helper_resource_destroy;
+ 
+    pscreen->transfer_helper =
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.h b/src/gallium/drivers/freedreno/freedreno_resource.h
+index d3ad6359fa17..3310134eef3b 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.h
++++ b/src/gallium/drivers/freedreno/freedreno_resource.h
+@@ -138,6 +138,11 @@ struct fd_resource {
+     */
+    bool is_replacement : 1;
+ 
++   /* A dma-buf imported from an external producer needs one explicit cache
++    * handoff before the first GPU read after each resource_changed(). */
++   bool tva_external_sync_valid : 1;
++   bool tva_external_barrier_pending : 1;
++
+    /* Uninitialized resources with UBWC format need their UBWC flag data
+     * cleared before writes, as the UBWC state is read and used during
+     * writes, so undefined UBWC flag data results in undefined results.
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
+index 9eb7bd8ea334..90895c23a16d 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -6,6 +6,8 @@
+  *    Rob Clark <robclark@freedesktop.org>
+  */
+ 
++#include "compiler/glsl_types.h"
++
+ #include "pipe/p_defines.h"
+ #include "pipe/p_screen.h"
+ #include "pipe/p_state.h"
+@@ -25,6 +27,7 @@
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include "drm-uapi/drm_fourcc.h"
+ 
+ #include "freedreno_fence.h"
+@@ -91,6 +94,34 @@ DEBUG_GET_ONCE_FLAGS_OPTION(fd_mesa_debug, "FD_MESA_DEBUG", fd_debug_options, 0)
+ int fd_mesa_debug = 0;
+ bool fd_binning_enabled = true;
+ 
++static bool
++fd_kgsl_dmabuf_enabled(void)
++{
++   /* The PRoot/container path has no DRM render node, so applications select
++    * the KGSL backend explicitly through TERMUX_VA_GPU_BACKEND.  Honor that
++    * selection before the screen is created; enabling it from the VA bridge
++    * would be too late for ANGLE's GBM allocations. */
++   const char *backend = getenv("TERMUX_VA_GPU_BACKEND");
++   return debug_get_bool_option("FD_KGSL_ENABLE_DMABUF", false) ||
++          debug_get_bool_option("XWAYLAND_FORCE_KGSL_SURFACELESS", false) ||
++          (backend && strcmp(backend, "kgsl") == 0);
++}
++
++static bool
++fd_termux_va_bridge_active(void)
++{
++   const char *force = os_get_option("TERMUX_VA_BRIDGE");
++   if (force && *force)
++      return strcmp(force, "0") != 0 && strcmp(force, "false") != 0 &&
++             strcmp(force, "off") != 0;
++
++   /* The daemon socket can remain present for the whole desktop session.
++    * Use the VA driver's process-level selection to distinguish a VA client
++    * from an unrelated OpenGL application in the same session. */
++   const char *driver = os_get_option("LIBVA_DRIVER_NAME");
++   return driver && strcmp(driver, "termuxva") == 0;
++}
++
+ static const char *
+ fd_screen_get_name(struct pipe_screen *pscreen)
+ {
+@@ -181,6 +212,8 @@ fd_screen_destroy(struct pipe_screen *pscreen)
+    if (screen->compiler)
+       ir3_screen_fini(pscreen);
+ 
++   glsl_type_singleton_decref();
++
+    free(screen->perfcntr_queries);
+    free(screen);
+ }
+@@ -383,6 +416,26 @@ fd_init_screen_caps(struct fd_screen *screen)
+ 
+    u_init_pipe_screen_caps(&screen->base, 1);
+ 
++   /* KGSL mappings are not CPU/GPU coherent on the Android kernels used by
++    * the termux-va bridge.  Do not let upload managers keep persistent maps
++    * while the bridge is active: they otherwise never call buffer_unmap after
++    * writing vertex and constant data, leaving no point at which the cache
++    * can be cleaned.  Ordinary KGSL OpenGL clients retain persistent maps so
++    * that ARB_buffer_storage and the corresponding GL 4.4+ capabilities stay
++    * available. */
++   if (screen->is_kgsl && fd_termux_va_bridge_active())
++      caps->buffer_map_persistent_coherent = false;
++
++   /* On the kgsl stack the screen's control fd may be a display/controller fd
++    * rather than the kgsl GPU fd, so drmGetCap(DRM_CAP_PRIME) cannot describe
++    * the backend's real import/export support.  The kgsl backend allocates
++    * shared buffers from dma-heap/ION and imports them into KGSL, so advertise
++    * dmabuf support only for that path. */
++   if (screen->kgsl_dmabuf) {
++      caps->dmabuf =
++         0x1 /*DRM_PRIME_CAP_IMPORT*/ | 0x2 /*DRM_PRIME_CAP_EXPORT*/;
++   }
++
+    /* this is probably not totally correct.. but it's a start: */
+ 
+    /* Supported features (boolean caps). */
+@@ -666,7 +719,7 @@ fd_init_screen_caps(struct fd_screen *screen)
+    caps->query_timestamp =
+    caps->query_time_elapsed =
+       /* only a4xx, requires new enough kernel so we know max_freq: */
+-      (screen->max_freq > 0) && (is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen));
++      (is_a4xx(screen) || is_a5xx(screen) || is_a6xx(screen));
+    caps->timer_resolution = fd_ticks_to_ns(1);
+    caps->query_buffer_object =
+    caps->query_so_overflow =
+@@ -786,6 +839,7 @@ fd_screen_bo_get_handle(struct pipe_screen *pscreen, struct fd_bo *bo,
+    struct fd_screen *screen = fd_screen(pscreen);
+ 
+    whandle->stride = stride;
++   whandle->size = fd_bo_size(bo);
+ 
+    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+       return fd_bo_get_name(bo, &whandle->handle) == 0;
+@@ -833,6 +887,23 @@ fd_screen_query_dmabuf_modifiers(struct pipe_screen *pscreen,
+                                  uint64_t *modifiers,
+                                  unsigned int *external_only, int *count)
+ {
++   struct fd_screen *screen = fd_screen(pscreen);
++
++   if (screen->kgsl_dmabuf) {
++      *count = is_format_supported(pscreen, format,
++                                   DRM_FORMAT_MOD_LINEAR) ? 1 : 0;
++
++      if (*count && max > 0) {
++         if (modifiers)
++            modifiers[0] = DRM_FORMAT_MOD_LINEAR;
++
++         if (external_only)
++            external_only[0] = !is_rendering_supported(pscreen, format);
++      }
++
++      return;
++   }
++
+    const uint64_t all_modifiers[] = {
+       DRM_FORMAT_MOD_LINEAR,
+       DRM_FORMAT_MOD_QCOM_COMPRESSED,
+@@ -865,6 +936,13 @@ fd_screen_is_dmabuf_modifier_supported(struct pipe_screen *pscreen,
+                                        enum pipe_format format,
+                                        bool *external_only)
+ {
++   struct fd_screen *screen = fd_screen(pscreen);
++
++   if (screen->kgsl_dmabuf &&
++       modifier != DRM_FORMAT_MOD_LINEAR &&
++       modifier != DRM_FORMAT_MOD_INVALID)
++      return false;
++
+    return is_format_supported(pscreen, format, modifier);
+ }
+ 
+@@ -947,14 +1025,19 @@ fd_screen_create(int fd,
+    if (!dev)
+       return NULL;
+ 
++   glsl_type_singleton_init_or_ref();
++
+    struct fd_screen *screen = CALLOC_STRUCT(fd_screen);
+    struct pipe_screen *pscreen;
+    uint64_t val;
+ 
+    fd_screen_debug_init();
+ 
+-   if (!screen)
++   if (!screen) {
++      glsl_type_singleton_decref();
++      fd_device_del(dev);
+       return NULL;
++   }
+ 
+ #ifdef HAVE_PERFETTO
+    fd_perfetto_init();
+@@ -965,6 +1048,8 @@ fd_screen_create(int fd,
+    pscreen = &screen->base;
+ 
+    screen->dev = dev;
++   screen->is_kgsl = fd_get_features(dev) & FD_FEATURE_KGSL;
++   screen->kgsl_dmabuf = screen->is_kgsl && fd_kgsl_dmabuf_enabled();
+    screen->ro = ro;
+ 
+    // maybe this should be in context?
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.h b/src/gallium/drivers/freedreno/freedreno_screen.h
+index 4a9e72447c0a..c3ff391753e4 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.h
++++ b/src/gallium/drivers/freedreno/freedreno_screen.h
+@@ -75,6 +75,8 @@ struct fd_screen {
+    bool has_timestamp;
+    bool has_robustness;
+    bool has_syncobj;
++   bool is_kgsl;
++   bool kgsl_dmabuf;
+ 
+    struct {
+       /* Conservative LRZ (default true) invalidates LRZ on draws with
+diff --git a/src/gallium/frontends/dri/dri2.c b/src/gallium/frontends/dri/dri2.c
+index 32aec12917d4..bada0e9d05f6 100644
+--- a/src/gallium/frontends/dri/dri2.c
++++ b/src/gallium/frontends/dri/dri2.c
+@@ -201,7 +201,8 @@ dri2_allocate_textures(struct dri_context *ctx,
+       /* Flush the texture before unreferencing, so that other clients can
+        * see what the driver has rendered.
+        */
+-      if (i != ST_ATTACHMENT_DEPTH_STENCIL && drawable->textures[i]) {
++      if (i != ST_ATTACHMENT_DEPTH_STENCIL && drawable->textures[i] &&
++          !(i == ST_ATTACHMENT_BACK_LEFT && drawable->back_buffer_fenced)) {
+          struct pipe_context *pipe = ctx->st->pipe;
+          pipe->flush_resource(pipe, drawable->textures[i]);
+       }
+@@ -209,6 +210,8 @@ dri2_allocate_textures(struct dri_context *ctx,
+       pipe_resource_reference(&drawable->textures[i], NULL);
+    }
+ 
++   drawable->back_buffer_fenced = false;
++
+    if (drawable->stvis.samples > 1) {
+       for (i = 0; i < ST_ATTACHMENT_COUNT; i++) {
+          bool del = true;
+@@ -578,6 +581,11 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+    const unsigned format_planes = util_format_get_num_planes(map->pipe_format);
+    uint64_t modifier = whandle[0].modifier;
+ 
++   if (getenv("DMD_VA_LOG"))
++      fprintf(stderr, "tva-dri import begin fourcc=%#x map=%s %ux%u handles=%d modifier=%#" PRIx64 "\n",
++              map->dri_fourcc, util_format_short_name(map->pipe_format),
++              width, height, num_handles, modifier);
++
+    if (format_and_modifier_supported(pscreen, map->pipe_format, screen->target, 0, 0,
+                                      PIPE_BIND_RENDER_TARGET, modifier))
+       tex_usage |= PIPE_BIND_RENDER_TARGET;
+@@ -593,6 +601,17 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+                                      screen->target, 0, 0, PIPE_BIND_SAMPLER_VIEW, modifier)) {
+       map = &r8_g8b8_mapping;
+       tex_usage |= PIPE_BIND_SAMPLER_VIEW;
++      /* On the KGSL/ANGLE path, importing the high-level
++       * R8_G8B8_420 resource can produce stale or incorrectly sampled
++       * frames even though the underlying dma-buf planes are valid.  Use the
++       * native R8/GR88 plane resources for that Android backend. */
++      const char *backend = getenv("TERMUX_VA_GPU_BACKEND");
++      if (backend && (!strcmp(backend, "kgsl") ||
++                      !strcmp(backend, "KGSL")))
++         use_lowered = true;
++      if (getenv("DMD_VA_LOG"))
++         fprintf(stderr, "tva-dri import fallback NV12 -> %s\n",
++                 util_format_short_name(map->pipe_format));
+    }
+ 
+    /* For NV21, see if we have support for sampling r8_b8g8 */
+@@ -713,6 +732,11 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+    if (!tex_usage)
+       return NULL;
+ 
++   if (getenv("DMD_VA_LOG"))
++      fprintf(stderr, "tva-dri import selected map=%s usage=%#x lowered=%d planes=%u\n",
++              util_format_short_name(map->pipe_format), tex_usage,
++              use_lowered, format_planes);
++
+    img = CALLOC_STRUCT(dri_image);
+    if (!img)
+       return NULL;
+@@ -738,12 +762,20 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+ 
+       tex = pscreen->resource_from_handle(pscreen, &templ, &whandle[i], handle_usage);
+       if (!tex) {
++         if (getenv("DMD_VA_LOG"))
++            fprintf(stderr, "tva-dri import resource failed extra plane=%d fmt=%s %ux%u stride=%u offset=%u\n",
++                    i, util_format_short_name(templ.format), templ.width0,
++                    templ.height0, whandle[i].stride, whandle[i].offset);
+          pipe_resource_reference(&img->texture, NULL);
+          FREE(img);
+          return NULL;
+       }
+ 
+       img->texture = tex;
++      if (getenv("DMD_VA_LOG"))
++         fprintf(stderr, "tva-dri import resource extra plane=%d fmt=%s %ux%u stride=%u offset=%u ok\n",
++                 i, util_format_short_name(templ.format), templ.width0,
++                 templ.height0, whandle[i].stride, whandle[i].offset);
+    }
+ 
+    for (i = (use_lowered ? map->nplanes : format_planes) - 1; i >= 0; i--) {
+@@ -762,6 +794,11 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+                &templ, &whandle[use_lowered ? map->planes[i].buffer_index : i],
+                handle_usage);
+       if (!tex) {
++         if (getenv("DMD_VA_LOG"))
++            fprintf(stderr, "tva-dri import resource failed plane=%d fmt=%s %ux%u stride=%u offset=%u\n",
++                    i, util_format_short_name(templ.format), templ.width0,
++                    templ.height0, whandle[use_lowered ? map->planes[i].buffer_index : i].stride,
++                    whandle[use_lowered ? map->planes[i].buffer_index : i].offset);
+          pipe_resource_reference(&img->texture, NULL);
+          FREE(img);
+          return NULL;
+@@ -780,6 +817,11 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+       }
+ 
+       img->texture = tex;
++      if (getenv("DMD_VA_LOG"))
++         fprintf(stderr, "tva-dri import resource plane=%d fmt=%s %ux%u stride=%u offset=%u ok\n",
++                 i, util_format_short_name(templ.format), templ.width0,
++                 templ.height0, whandle[use_lowered ? map->planes[i].buffer_index : i].stride,
++                 whandle[use_lowered ? map->planes[i].buffer_index : i].offset);
+    }
+ 
+    img->level = 0;
+@@ -839,9 +881,24 @@ dri_create_image(struct dri_screen *screen,
+    enum pipe_format pipe_format;
+    unsigned tex_usage = 0;
+    unsigned count = _count;
++   int image_format = format;
+ 
+-   if (!map)
++   /* Planar GBM formats use their Gallium alias as the create-image input,
++    * while the DRI mapping table only carries the DRM FourCC. */
++   if (!map && format == PIPE_FORMAT_R8_G8B8_420_UNORM) {
++      map = &r8_g8b8_mapping;
++      image_format = PIPE_FORMAT_NV12;
++   }
++
++   if (getenv("DMD_VA_LOG") && format == PIPE_FORMAT_R8_G8B8_420_UNORM)
++      fprintf(stderr, "tva-dri create image format=%d map=%p size=%dx%d\n", format,
++              (void *) map, width, height);
++
++   if (!map) {
++      if (getenv("DMD_VA_LOG"))
++         fprintf(stderr, "tva-dri create image has no format mapping\\n");
+       return NULL;
++   }
+ 
+    if (modifiers && count > 0) {
+       bool has_valid_modifier = false;
+@@ -871,8 +928,12 @@ dri_create_image(struct dri_screen *screen,
+ 
+    pipe_format = dri2_get_create_format(screen, map->pipe_format, &tex_usage);
+ 
+-   if (!tex_usage)
++   if (!tex_usage) {
++      if (getenv("DMD_VA_LOG") && format == PIPE_FORMAT_R8_G8B8_420_UNORM)
++         fprintf(stderr, "tva-dri create image format unsupported pipe=%u\n",
++                 map->pipe_format);
+       return NULL;
++   }
+ 
+    if (use & __DRI_IMAGE_USE_SCANOUT)
+       tex_usage |= PIPE_BIND_SCANOUT;
+@@ -904,24 +965,78 @@ dri_create_image(struct dri_screen *screen,
+    templ.depth0 = 1;
+    templ.array_size = 1;
+ 
+-   if (modifiers)
++   if (map->nplanes > 1) {
++      struct pipe_resource *next = NULL;
++      unsigned plane_width = width;
++      const char *backend = getenv("TERMUX_VA_GPU_BACKEND");
++
++      /* KGSL aligns the R8 and RG8 planes to 64 texels, giving chroma a
++       * 128-byte pitch alignment. Pad both allocations to that byte width
++       * so Chromium's NV12 layout validation never sees UV stride > Y
++       * stride. The DRI image keeps the application's visible dimensions. */
++      if (map->dri_fourcc == DRM_FORMAT_NV12 && backend &&
++          (!strcmp(backend, "kgsl") || !strcmp(backend, "KGSL")))
++         plane_width = align(width, 128);
++
++      /* Planar GBM allocations are represented by one resource per plane.
++       * The resources may use separate dma-bufs; GBM exposes them through
++       * the per-plane handle accessors. */
++      for (int plane = map->nplanes - 1; plane >= 0; plane--) {
++         struct pipe_resource plane_templ = templ;
++
++         if (map->planes[plane].dri_format == __DRI_IMAGE_FORMAT_NONE) {
++            pipe_resource_reference(&next, NULL);
++            FREE(img);
++            return NULL;
++         }
++
++         plane_templ.format = map->planes[plane].dri_format;
++         plane_templ.width0 = DIV_ROUND_UP(plane_width,
++                                         1u << map->planes[plane].width_shift);
++         plane_templ.height0 = DIV_ROUND_UP(height,
++                                          1u << map->planes[plane].height_shift);
++         plane_templ.next = next;
++
++         struct pipe_resource *resource;
++         if (modifiers)
++            resource = pscreen->resource_create_with_modifiers(pscreen,
++                                                               &plane_templ,
++                                                               modifiers,
++                                                               count);
++         else
++            resource = pscreen->resource_create(pscreen, &plane_templ);
++
++         if (!resource) {
++            pipe_resource_reference(&next, NULL);
++            FREE(img);
++            return NULL;
++         }
++
++         next = resource;
++      }
++      img->texture = next;
++   } else if (modifiers) {
+       img->texture =
+          screen->base.screen
+             ->resource_create_with_modifiers(screen->base.screen,
+                                              &templ,
+                                              modifiers,
+                                              count);
+-   else
++   } else {
+       img->texture =
+          screen->base.screen->resource_create(screen->base.screen, &templ);
++   }
+    if (!img->texture) {
++      if (getenv("DMD_VA_LOG") && format == PIPE_FORMAT_R8_G8B8_420_UNORM)
++         fprintf(stderr, "tva-dri create image resource allocation failed pipe=%u\n",
++                 map->pipe_format);
+       FREE(img);
+       return NULL;
+    }
+ 
+    img->level = 0;
+    img->layer = 0;
+-   img->dri_format = format;
++   img->dri_format = image_format;
+    img->dri_fourcc = dri2_get_image_fourcc(screen, map, pipe_format);
+    img->use = use;
+    img->in_fence_fd = -1;
+@@ -1315,6 +1430,11 @@ dri2_from_dma_bufs(struct dri_screen *screen,
+    const struct dri2_format_mapping *map =
+       dri2_get_import_mapping(screen, fourcc, &import_map);
+ 
++   if (getenv("DMD_VA_LOG"))
++      fprintf(stderr, "tva-dri from_dma_bufs fourcc=%#x %ux%u modifier=%#" PRIx64 " fds=%d map=%s\n",
++              fourcc, width, height, modifier, num_fds,
++              map ? util_format_short_name(map->pipe_format) : "none");
++
+    if (!screen->dmabuf_import) {
+       if (error)
+          *error = __DRI_IMAGE_ERROR_BAD_PARAMETER;
+@@ -1336,11 +1456,17 @@ dri2_from_dma_bufs(struct dri_screen *screen,
+    const int expected_num_fds =
+       map ? dri2_get_modifier_num_planes(screen, modifier, map->dri_fourcc) : 0;
+    if (expected_num_fds == 0) {
++      if (getenv("DMD_VA_LOG"))
++         fprintf(stderr, "tva-dri from_dma_bufs reject map=%p expected_fds=%d\n",
++                 (void *)map, expected_num_fds);
+       err = __DRI_IMAGE_ERROR_BAD_MATCH;
+       goto exit;
+    }
+ 
+    if (num_fds != expected_num_fds) {
++      if (getenv("DMD_VA_LOG"))
++         fprintf(stderr, "tva-dri from_dma_bufs reject fd count=%d expected=%d\n",
++                 num_fds, expected_num_fds);
+       err = __DRI_IMAGE_ERROR_BAD_MATCH;
+       goto exit;
+    }
+diff --git a/src/gallium/frontends/dri/dri_context.c b/src/gallium/frontends/dri/dri_context.c
+index 21251fdf839e..6f9c57899129 100644
+--- a/src/gallium/frontends/dri/dri_context.c
++++ b/src/gallium/frontends/dri/dri_context.c
+@@ -32,6 +32,7 @@
+ #include "dri_screen.h"
+ #include "dri_drawable.h"
+ #include "dri_context.h"
++#include "dri_util.h"
+ #include "frontend/drm_driver.h"
+ 
+ #include "pipe/p_context.h"
+@@ -42,6 +43,16 @@
+ #include "util/u_memory.h"
+ #include "util/u_debug.h"
+ 
++void
++dri_disable_present_wait_fence(struct dri_context *ctx, bool disable)
++{
++   struct pipe_context *pipe = ctx->st->pipe;
++   if (pipe->set_context_param)
++      pipe->set_context_param(pipe,
++                              PIPE_CONTEXT_PARAM_DISABLE_PRESENT_WAIT_FENCE,
++                              disable);
++}
++
+ struct dri_context *
+ dri_create_context(struct dri_screen *screen,
+                    struct st_context_attribs *attribs,
+@@ -136,6 +147,9 @@ dri_create_context(struct dri_screen *screen,
+    if (!thread_safe)
+       enable_glthread = false;
+ 
++   dri_disable_present_wait_fence(ctx, debug_get_bool_option(
++      "MESA_DRI3_DISABLE_PRESENT_WAIT_FENCE", false));
++
+    /* Do this last. */
+    if (enable_glthread)
+       _mesa_glthread_init(ctx->st->ctx);
+diff --git a/src/gallium/frontends/dri/dri_drawable.c b/src/gallium/frontends/dri/dri_drawable.c
+index bdf31f5cdd9b..89c992f37848 100644
+--- a/src/gallium/frontends/dri/dri_drawable.c
++++ b/src/gallium/frontends/dri/dri_drawable.c
+@@ -144,6 +144,12 @@ dri_st_framebuffer_validate(struct st_context *st,
+    if (!out)
+       return true;
+ 
++   /* Once the state tracker gets the attachments it may render to them again.
++    * This also invalidates the optimization when validation reused an image
++    * without calling allocate_textures().
++    */
++   drawable->back_buffer_fenced = false;
++
+    /* Set the window-system buffers for the gallium frontend. */
+    for (i = 0; i < count; i++)
+       pipe_resource_reference(&out[i], textures[statts[i]]);
+@@ -630,30 +636,36 @@ notify_before_flush_cb(void* _args)
+  * \param flags             a combination of _DRI2_FLUSH_xxx flags
+  * \param throttle_reason   the reason for throttling, 0 = no throttling
+  */
+-void
+-dri_flush(struct dri_context *ctx,
+-          struct dri_drawable *drawable,
+-          unsigned flags,
+-          enum __DRI2throttleReason reason)
++static int
++dri_flush_impl(struct dri_context *ctx,
++               struct dri_drawable *drawable,
++               unsigned flags,
++               enum __DRI2throttleReason reason,
++               bool request_fence_fd)
+ {
+    struct st_context *st;
++   struct pipe_screen *screen;
++   struct pipe_fence_handle *new_fence = NULL;
+    unsigned flush_flags;
++   int fence_fd = -1;
+    struct notify_before_flush_cb_args args = { 0 };
+ 
+    if (!ctx) {
+       assert(0);
+-      return;
++      return -1;
+    }
+ 
+    st = ctx->st;
++   screen = ctx->screen->base.screen;
+    _mesa_glthread_finish(st->ctx);
+ 
+    if (drawable) {
+       /* prevent recursion */
+       if (drawable->flushing)
+-         return;
++         return -1;
+ 
+       drawable->flushing = true;
++      drawable->back_buffer_fenced = false;
+    }
+    else {
+       flags &= ~__DRI2_FLUSH_DRAWABLE;
+@@ -680,23 +692,53 @@ dri_flush(struct dri_context *ctx,
+        reason == __DRI2_NOTHROTTLE_SWAPBUFFER)
+       flush_flags |= ST_FLUSH_END_OF_FRAME;
+ 
+-   /* Flush the context and throttle if needed. */
+-   if (ctx->screen->throttle &&
+-       drawable &&
+-       (reason == __DRI2_THROTTLE_SWAPBUFFER ||
+-        reason == __DRI2_THROTTLE_FLUSHFRONT)) {
++   if (request_fence_fd && screen->caps.native_fence_fd) {
++      if (st->pipe->set_context_param) {
++         st->pipe->set_context_param(st->pipe,
++                                     PIPE_CONTEXT_PARAM_EXPLICIT_PRESENT_FENCE,
++                                     true);
++      }
++      flush_flags |= ST_FLUSH_FENCE_FD;
++   } else {
++      request_fence_fd = false;
++   }
+ 
+-      struct pipe_screen *screen = drawable->screen->base.screen;
+-      struct pipe_fence_handle *new_fence = NULL;
++   /* Flush the context and throttle if needed. */
++   const bool throttle = ctx->screen->throttle && drawable &&
++      (reason == __DRI2_THROTTLE_SWAPBUFFER ||
++       reason == __DRI2_THROTTLE_FLUSHFRONT);
+ 
++   if ((flags & (__DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_CONTEXT)) &&
++       (throttle || request_fence_fd)) {
+       st_context_flush(st, flush_flags, &new_fence, args.ctx ? notify_before_flush_cb : NULL, &args);
+ 
+-      /* throttle on the previous fence */
+-      if (drawable->throttle_fence) {
+-         screen->fence_finish(screen, NULL, drawable->throttle_fence, OS_TIMEOUT_INFINITE);
+-         screen->fence_reference(screen, &drawable->throttle_fence, NULL);
++      if (request_fence_fd && new_fence)
++         fence_fd = screen->fence_get_fd(screen, new_fence);
++
++      /* If native-fence export failed after the rendering flush, wait on the
++       * exact pipe fence before allowing an unfenced Present request.
++       */
++      if (request_fence_fd && fence_fd < 0) {
++         if (!new_fence)
++            st_context_flush(st, 0, &new_fence, NULL, NULL);
++         if (new_fence)
++            screen->fence_finish(screen, NULL, new_fence,
++                                 OS_TIMEOUT_INFINITE);
+       }
+-      drawable->throttle_fence = new_fence;
++
++      if (throttle) {
++         /* throttle on the previous fence */
++         if (drawable->throttle_fence) {
++            screen->fence_finish(screen, NULL, drawable->throttle_fence,
++                                 OS_TIMEOUT_INFINITE);
++            screen->fence_reference(screen, &drawable->throttle_fence, NULL);
++         }
++         drawable->throttle_fence = new_fence;
++         new_fence = NULL;
++      }
++
++      if (new_fence)
++         screen->fence_reference(screen, &new_fence, NULL);
+    }
+    else if (flags & (__DRI2_FLUSH_DRAWABLE | __DRI2_FLUSH_CONTEXT)) {
+       st_context_flush(st, flush_flags, NULL, args.ctx ? notify_before_flush_cb : NULL, &args);
+@@ -724,7 +766,33 @@ dri_flush(struct dri_context *ctx,
+       p_atomic_inc(&drawable->base.stamp);
+    }
+ 
++   if (drawable && args.ctx && fence_fd >= 0 &&
++       !ctx->is_shared_buffer_bound &&
++       (reason == __DRI2_THROTTLE_SWAPBUFFER ||
++        reason == __DRI2_NOTHROTTLE_SWAPBUFFER)) {
++      drawable->back_buffer_fenced = true;
++   }
++
+    st_context_invalidate_state(st, ST_INVALIDATE_FB_STATE);
++   return fence_fd;
++}
++
++void
++dri_flush(struct dri_context *ctx,
++          struct dri_drawable *drawable,
++          unsigned flags,
++          enum __DRI2throttleReason reason)
++{
++   dri_flush_impl(ctx, drawable, flags, reason, false);
++}
++
++int
++dri_flush_with_fence_fd(struct dri_context *ctx,
++                        struct dri_drawable *drawable,
++                        unsigned flags,
++                        enum __DRI2throttleReason reason)
++{
++   return dri_flush_impl(ctx, drawable, flags, reason, true);
+ }
+ 
+ /**
+diff --git a/src/gallium/frontends/dri/dri_drawable.h b/src/gallium/frontends/dri/dri_drawable.h
+index 58be595e1a6f..28fb930808dc 100644
+--- a/src/gallium/frontends/dri/dri_drawable.h
++++ b/src/gallium/frontends/dri/dri_drawable.h
+@@ -62,6 +62,12 @@ struct dri_drawable
+    struct pipe_fence_handle *throttle_fence;
+    bool flushing; /* prevents recursion in dri_flush */
+ 
++   /* The current back attachment was flushed by an explicit-fence swap and
++    * has not been handed back to the state tracker for further use. Its
++    * replacement need not repeat the external-consumer flush.
++    */
++   bool back_buffer_fenced;
++
+    /**
+     * Private data from the loader.  We just hold on to it and pass
+     * it back when calling into loader provided functions.
+@@ -137,6 +143,12 @@ dri_flush(struct dri_context *ctx,
+           unsigned flags,
+           enum __DRI2throttleReason reason);
+ 
++int
++dri_flush_with_fence_fd(struct dri_context *ctx,
++                        struct dri_drawable *drawable,
++                        unsigned flags,
++                        enum __DRI2throttleReason reason);
++
+ void
+ dri_flush_drawable(struct dri_drawable *dPriv);
+ 
+diff --git a/src/gallium/frontends/dri/dri_helpers.c b/src/gallium/frontends/dri/dri_helpers.c
+index 0c95b63e2f8a..b3727d9f02a1 100644
+--- a/src/gallium/frontends/dri/dri_helpers.c
++++ b/src/gallium/frontends/dri/dri_helpers.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include <dlfcn.h>
++#include <inttypes.h>
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/u_memory.h"
+ #include "pipe/p_screen.h"
+@@ -741,6 +742,14 @@ dri2_get_mapping_by_format(int format)
+          return &dri2_format_table[i];
+    }
+ 
++   /* GBM passes the Gallium format for planar images because there is no
++    * legacy DRI image-format token for those formats. */
++   for (unsigned i = 0; i < ARRAY_SIZE(dri2_format_table); i++) {
++      if (dri2_format_table[i].dri_format == __DRI_IMAGE_FORMAT_NONE &&
++          dri2_format_table[i].pipe_format == format)
++         return &dri2_format_table[i];
++   }
++
+    /* an image with the fixed little-endian variant of a format */
+    for (unsigned i = 0; i < ARRAY_SIZE(dri2_format_table); i++) {
+       if (util_format_le_byte_order(dri2_format_table[i].dri_format) == format)
+diff --git a/src/gallium/frontends/dri/dri_util.h b/src/gallium/frontends/dri/dri_util.h
+index 2b6ca2836e17..39a4163f3924 100644
+--- a/src/gallium/frontends/dri/dri_util.h
++++ b/src/gallium/frontends/dri/dri_util.h
+@@ -139,11 +139,19 @@ dri_query_renderer_integer(struct dri_screen *_screen, int param,
+ 
+ PUBLIC void
+ dri_flush_drawable(struct dri_drawable *dPriv);
++/* Set the window-system policy before the context is made current. */
++PUBLIC void
++dri_disable_present_wait_fence(struct dri_context *ctx, bool disable);
+ PUBLIC void
+ dri_flush(struct dri_context *cPriv,
+           struct dri_drawable *dPriv,
+           unsigned flags,
+           enum __DRI2throttleReason reason);
++PUBLIC int
++dri_flush_with_fence_fd(struct dri_context *cPriv,
++                        struct dri_drawable *dPriv,
++                        unsigned flags,
++                        enum __DRI2throttleReason reason);
+ PUBLIC void
+ dri_invalidate_drawable(struct dri_drawable *drawable);
+ 
+diff --git a/src/gallium/frontends/dri/loader_dri3_helper.c b/src/gallium/frontends/dri/loader_dri3_helper.c
+index eb2894c68c0d..c5b17bc9351e 100644
+--- a/src/gallium/frontends/dri/loader_dri3_helper.c
++++ b/src/gallium/frontends/dri/loader_dri3_helper.c
+@@ -22,23 +22,31 @@
+  */
+ 
+ #include <fcntl.h>
++#include <errno.h>
++#include <poll.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <string.h>
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
+ 
+-#include <X11/xshmfence.h>
+ #include <xcb/xcb.h>
+ #include <xcb/dri3.h>
+ #include <xcb/present.h>
+-#include <xcb/xfixes.h>
++#include <xcb/sync.h>
+ 
+ #include <X11/Xlib-xcb.h>
+ 
+ #include "loader_dri_helper.h"
+ #include "loader_dri3_helper.h"
+ #include "pipe/p_screen.h"
++#include "drm-uapi/dma-buf.h"
++#include "util/libsync.h"
+ #include "util/log.h"
+ #include "util/macros.h"
++#include "util/u_atomic.h"
++#include "util/u_queue.h"
++#include "util/u_debug.h"
+ #include "util/simple_mtx.h"
+ #include "drm-uapi/drm_fourcc.h"
+ #include "dri_screen.h"
+@@ -58,6 +66,212 @@ static struct loader_dri3_blit_context blit_context = {
+    SIMPLE_MTX_INITIALIZER, NULL
+ };
+ 
++struct loader_dri3_present_sync {
++   struct util_queue queue;
++   int cancel_fd;
++};
++
++struct loader_dri3_present_job {
++   xcb_connection_t *conn;
++   xcb_sync_fence_t fence;
++   int *fence_triggered;
++   int fence_fd;
++   int cancel_fd;
++};
++
++static void
++dri3_present_job_execute(void *data, void *gdata, int thread_index)
++{
++   struct loader_dri3_present_job *job = data;
++   struct pollfd fds[2] = {
++      { .fd = job->fence_fd, .events = POLLIN },
++      { .fd = job->cancel_fd, .events = POLLIN },
++   };
++   int ret;
++
++   do {
++      ret = poll(fds, ARRAY_SIZE(fds), -1);
++   } while (ret < 0 && errno == EINTR);
++
++   if (ret < 0) {
++      mesa_loge("DRI3: failed to wait for presentation fence: %s",
++                strerror(errno));
++   }
++
++   if (ret > 0 && fds[1].revents)
++      return;
++
++   /* A sync_file normally signals with POLLIN.  Trigger on an error too so a
++    * broken fence cannot leave the X server permanently blocked.
++    */
++   if (ret > 0 && !(fds[0].revents & POLLIN))
++      mesa_loge("DRI3: presentation fence reported poll events 0x%x",
++                fds[0].revents);
++
++   /* Queue TriggerFence under XCB's connection lock before publishing the
++    * state.  Any ResetFence submitted by the reuse thread after observing the
++    * state is therefore serialized after this trigger request.
++    */
++   xcb_sync_trigger_fence(job->conn, job->fence);
++   p_atomic_set(job->fence_triggered, true);
++   xcb_flush(job->conn);
++}
++
++static void
++dri3_present_job_cleanup(void *data, void *gdata, int thread_index)
++{
++   struct loader_dri3_present_job *job = data;
++
++   close(job->fence_fd);
++   free(job);
++}
++
++static void
++dri3_present_sync_fini(struct loader_dri3_drawable *draw)
++{
++   struct loader_dri3_present_sync *sync = draw->present_sync;
++
++   if (!sync)
++      return;
++
++   eventfd_write(sync->cancel_fd, 1);
++   util_queue_finish(&sync->queue);
++   util_queue_destroy(&sync->queue);
++   close(sync->cancel_fd);
++   free(sync);
++   draw->present_sync = NULL;
++}
++
++static bool
++dri3_dmabuf_sync_file_unavailable(int fd)
++{
++   struct dma_buf_export_sync_file export = {
++      .flags = DMA_BUF_SYNC_RW,
++      .fd = -1,
++   };
++
++   if (ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export) == 0) {
++      close(export.fd);
++      return false;
++   }
++
++   return errno == ENOTTY || errno == ENOSYS;
++}
++
++static bool
++dri3_present_sync_init(struct loader_dri3_drawable *draw, int buffer_fd)
++{
++   struct loader_dri3_present_sync *sync;
++
++   if (draw->present_sync_checked)
++      return draw->present_sync != NULL;
++
++   draw->present_sync_checked = true;
++
++   if (draw->type != LOADER_DRI3_DRAWABLE_WINDOW ||
++       draw->dri_screen_render_gpu != draw->dri_screen_display_gpu ||
++       !(dri_fence_get_caps(draw->dri_screen_render_gpu) &
++         __DRI_FENCE_CAP_NATIVE_FD) ||
++       !dri3_dmabuf_sync_file_unavailable(buffer_fd))
++      return false;
++
++   sync = calloc(1, sizeof(*sync));
++   if (!sync)
++      return false;
++
++   sync->cancel_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++   if (sync->cancel_fd < 0)
++      goto fail;
++
++   if (!util_queue_init(&sync->queue, "present", 8, 1,
++                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL))
++      goto fail_cancel_fd;
++
++   draw->present_sync = sync;
++   return true;
++
++fail_cancel_fd:
++   close(sync->cancel_fd);
++fail:
++   free(sync);
++   return false;
++}
++
++static void
++dri3_setup_present_wait_fence(struct loader_dri3_drawable *draw,
++                              struct loader_dri3_buffer *buffer)
++{
++   if (!draw->present_sync)
++      return;
++
++   buffer->present_wait_fence = xcb_generate_id(draw->conn);
++   xcb_void_cookie_t cookie =
++      xcb_sync_create_fence_checked(draw->conn, draw->window,
++                                    buffer->present_wait_fence, false);
++   xcb_generic_error_t *error = xcb_request_check(draw->conn, cookie);
++   if (error) {
++      mesa_loge("DRI3: failed to create Present wait fence: X error %u",
++                error->error_code);
++      free(error);
++      buffer->present_wait_fence = 0;
++   } else {
++      util_queue_fence_init(&buffer->present_wait_job);
++   }
++}
++
++static xcb_sync_fence_t
++dri3_queue_present_wait_fence(struct loader_dri3_drawable *draw,
++                              struct loader_dri3_buffer *buffer,
++                              int fence_fd)
++{
++   struct loader_dri3_present_job *job;
++
++   if (fence_fd < 0)
++      return XCB_NONE;
++
++   if (!draw->present_sync || !buffer->present_wait_fence)
++      goto sync_fallback;
++
++   job = calloc(1, sizeof(*job));
++   if (!job)
++      goto sync_fallback;
++
++   job->conn = draw->conn;
++   job->fence = buffer->present_wait_fence;
++   job->fence_triggered = &buffer->present_wait_fence_triggered;
++   job->fence_fd = fence_fd;
++   job->cancel_fd = draw->present_sync->cancel_fd;
++
++   /* A skipped Present can release its pixmap before the render fence has
++    * signaled. Buffer idleness therefore does not imply that the previous
++    * worker is done with this reusable X Sync fence. Finish that job before
++    * resetting the fence or associating it with another submission.
++    */
++   util_queue_fence_wait(&buffer->present_wait_job);
++
++   /* A Sync fence remains triggered until its owner resets it.  Reset only
++    * after our previous worker has triggered this per-buffer fence; resetting
++    * an unsignaled fence is a Sync Match error.  XCB serializes the reset
++    * before the new worker's trigger request on the shared connection.
++    */
++   if (p_atomic_read(&buffer->present_wait_fence_triggered)) {
++      xcb_sync_reset_fence(draw->conn, buffer->present_wait_fence);
++      p_atomic_set(&buffer->present_wait_fence_triggered, false);
++   }
++
++   util_queue_add_job(&draw->present_sync->queue, job, &buffer->present_wait_job,
++                      dri3_present_job_execute, dri3_present_job_cleanup,
++                      sizeof(*job));
++   return buffer->present_wait_fence;
++
++sync_fallback:
++   if (sync_wait(fence_fd, -1))
++      mesa_loge("DRI3: failed to wait for presentation fence: %s",
++                strerror(errno));
++   close(fence_fd);
++   return XCB_NONE;
++}
++
+ static void
+ dri3_flush_present_events(struct loader_dri3_drawable *draw);
+ 
+@@ -246,19 +460,16 @@ loader_dri3_blit_image(struct loader_dri3_drawable *draw,
+ static inline void
+ dri3_fence_reset(xcb_connection_t *c, struct loader_dri3_buffer *buffer)
+ {
+-   xshmfence_reset(buffer->shm_fence);
+ }
+ 
+ static inline void
+ dri3_fence_set(struct loader_dri3_buffer *buffer)
+ {
+-   xshmfence_trigger(buffer->shm_fence);
+ }
+ 
+ static inline void
+ dri3_fence_trigger(xcb_connection_t *c, struct loader_dri3_buffer *buffer)
+ {
+-   xcb_sync_trigger_fence(c, buffer->sync_fence);
+ }
+ 
+ static inline void
+@@ -266,7 +477,6 @@ dri3_fence_await(xcb_connection_t *c, struct loader_dri3_drawable *draw,
+                  struct loader_dri3_buffer *buffer)
+ {
+    xcb_flush(c);
+-   xshmfence_await(buffer->shm_fence);
+    if (draw) {
+       mtx_lock(&draw->mtx);
+       dri3_flush_present_events(draw);
+@@ -291,6 +501,15 @@ dri3_update_max_num_back(struct loader_dri3_drawable *draw)
+    case XCB_PRESENT_COMPLETE_MODE_SKIP:
+       break;
+ 
++   case XCB_PRESENT_COMPLETE_MODE_COPY:
++      /* With an explicit render wait, two buffers can both be held by
++       * Present while the worker signals one and the server copies the other.
++       * Allow an uncapped client to render into a third buffer during that
++       * handoff. Keep the existing limit for interval-controlled swaps.
++       */
++      draw->max_num_back = draw->present_sync && draw->swap_interval == 0 ? 3 : 2;
++      break;
++
+    default:
+       draw->max_num_back = 2;
+    }
+@@ -340,10 +559,15 @@ dri3_free_render_buffer(struct loader_dri3_drawable *draw,
+    if (!buffer)
+       return;
+ 
++   if (buffer->present_wait_fence && draw->present_sync)
++      util_queue_fence_wait(&buffer->present_wait_job);
++
++   if (buffer->present_wait_fence) {
++      util_queue_fence_destroy(&buffer->present_wait_job);
++      xcb_sync_destroy_fence(draw->conn, buffer->present_wait_fence);
++   }
+    if (buffer->own_pixmap)
+       xcb_free_pixmap(draw->conn, buffer->pixmap);
+-   xcb_sync_destroy_fence(draw->conn, buffer->sync_fence);
+-   xshmfence_unmap_shm(buffer->shm_fence);
+    dri2_destroy_image(buffer->image);
+    if (buffer->linear_buffer)
+       dri2_destroy_image(buffer->linear_buffer);
+@@ -360,6 +584,7 @@ loader_dri3_drawable_fini(struct loader_dri3_drawable *draw)
+ {
+    int i;
+ 
++   dri3_present_sync_fini(draw);
+    driDestroyDrawable(draw->dri_drawable);
+ 
+    for (i = 0; i < ARRAY_SIZE(draw->buffers); i++)
+@@ -407,6 +632,8 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
+    draw->multiplanes_available = multiplanes_available;
+    draw->prefer_back_buffer_reuse = prefer_back_buffer_reuse;
+    draw->queries_buffer_age = false;
++   draw->present_sync_checked = false;
++   draw->present_sync = NULL;
+ 
+    draw->have_back = 0;
+    draw->have_fake_front = 0;
+@@ -834,6 +1061,20 @@ loader_dri3_flush(struct loader_dri3_drawable *draw,
+    }
+ }
+ 
++int
++loader_dri3_flush_with_fence_fd(struct loader_dri3_drawable *draw,
++                                unsigned flags,
++                                enum __DRI2throttleReason throttle_reason)
++{
++   struct dri_context *dri_context = draw->vtable->get_dri_context(draw);
++
++   if (!dri_context)
++      return -1;
++
++   return dri_flush_with_fence_fd(dri_context, draw->dri_drawable, flags,
++                                  throttle_reason);
++}
++
+ void
+ loader_dri3_copy_sub_buffer(struct loader_dri3_drawable *draw,
+                             int x, int y,
+@@ -1011,6 +1252,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+ {
+    struct loader_dri3_buffer *back;
+    int64_t ret = 0;
++   int render_fence_fd = -1;
+    bool wait_for_next_buffer = false;
+ 
+    /* GLX spec:
+@@ -1041,12 +1283,22 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+    if (!draw->have_back || draw->type == LOADER_DRI3_DRAWABLE_PIXMAP)
+       return ret;
+ 
+-   draw->vtable->flush_drawable(draw, flush_flags);
++   if (draw->type == LOADER_DRI3_DRAWABLE_WINDOW &&
++       draw->present_sync &&
++       draw->vtable->flush_drawable_with_fence_fd) {
++      render_fence_fd =
++         draw->vtable->flush_drawable_with_fence_fd(draw, flush_flags);
++   } else {
++      draw->vtable->flush_drawable(draw, flush_flags);
++   }
+ 
+    back = dri3_find_back_alloc(draw);
+    /* Could only happen when error case, like display is already closed. */
+-   if (!back)
++   if (!back) {
++      if (render_fence_fd >= 0)
++         close(render_fence_fd);
+       return ret;
++   }
+ 
+    mtx_lock(&draw->mtx);
+ 
+@@ -1171,26 +1423,10 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+       back->busy = 1;
+       back->last_swap = draw->send_sbc;
+ 
+-      if (!draw->region) {
+-         draw->region = xcb_generate_id(draw->conn);
+-         xcb_xfixes_create_region(draw->conn, draw->region, 0, NULL);
+-      }
++      xcb_sync_fence_t wait_fence =
++         dri3_queue_present_wait_fence(draw, back, render_fence_fd);
+ 
+       xcb_xfixes_region_t region = 0;
+-      xcb_rectangle_t xcb_rects[64];
+-
+-      if (n_rects > 0 && n_rects <= ARRAY_SIZE(xcb_rects)) {
+-         for (int i = 0; i < n_rects; i++) {
+-            const int *rect = &rects[i * 4];
+-            xcb_rects[i].x = rect[0];
+-            xcb_rects[i].y = draw->height - rect[1] - rect[3];
+-            xcb_rects[i].width = rect[2];
+-            xcb_rects[i].height = rect[3];
+-         }
+-
+-         region = draw->region;
+-         xcb_xfixes_set_region(draw->conn, region, n_rects, xcb_rects);
+-      }
+ 
+       xcb_present_pixmap(draw->conn,
+                          draw->drawable,
+@@ -1201,7 +1437,7 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
+                          0,                                    /* x_off */
+                          0,                                    /* y_off */
+                          None,                                 /* target_crtc */
+-                         None,
++                         wait_fence,
+                          back->sync_fence,
+                          options,
+                          target_msc,
+@@ -1423,27 +1659,13 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+    struct dri_image *pixmap_buffer = NULL, *linear_buffer_display_gpu = NULL;
+    enum pipe_format format = loader_fourcc_to_pipe_format(fourcc);
+    xcb_pixmap_t pixmap;
+-   xcb_sync_fence_t sync_fence;
+-   struct xshmfence *shm_fence;
+-   int buffer_fds[4], fence_fd;
++   int buffer_fds[4];
+    int num_planes = 0;
+    uint64_t *modifiers = NULL;
+    uint32_t count = 0;
+    int i, mod;
+    int ret;
+ 
+-   /* Create an xshmfence object and
+-    * prepare to send that to the X server
+-    */
+-
+-   fence_fd = xshmfence_alloc_shm();
+-   if (fence_fd < 0)
+-      return NULL;
+-
+-   shm_fence = xshmfence_map_shm(fence_fd);
+-   if (shm_fence == NULL)
+-      goto no_shm_fence;
+-
+    /* Allocate the image from the driver
+     */
+    buffer = calloc(1, sizeof *buffer);
+@@ -1604,6 +1826,13 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+    if (!ret)
+       buffer->modifier = DRM_FORMAT_MOD_INVALID;
+ 
++   /* Some Android/Xwayland combinations cannot consume the XSync wait fence
++    * reliably.  Keep an escape hatch for those sessions while retaining the
++    * explicit bridge by default on other platforms.
++    */
++   if (!debug_get_bool_option("MESA_DRI3_DISABLE_PRESENT_WAIT_FENCE", false))
++      dri3_present_sync_init(draw, buffer_fds[0]);
++
+    if (draw->dri_screen_render_gpu != draw->dri_screen_display_gpu &&
+        draw->dri_screen_display_gpu && linear_buffer_display_gpu) {
+       /* The linear buffer was created in the display GPU's vram, so we
+@@ -1641,7 +1870,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+                                                         buffer->strides[2], buffer->offsets[2],
+                                                         buffer->strides[3], buffer->offsets[3],
+                                                         depth, buffer->cpp * 8,
+-                                                        buffer->modifier,
++                                                        buffer->modifier ? buffer->modifier : 1274,
+                                                         buffer_fds);
+    } else {
+       cookie_pix = xcb_dri3_pixmap_from_buffer_checked(draw->conn,
+@@ -1652,23 +1881,16 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+                                                        depth, buffer->cpp * 8,
+                                                        buffer_fds[0]);
+    }
+-   cookie_fence = xcb_dri3_fence_from_fd_checked(draw->conn,
+-                                                 pixmap,
+-                                                 (sync_fence = xcb_generate_id(draw->conn)),
+-                                                 false,
+-                                                 fence_fd);
++
+    /* Group error checking to limit round-trips. */
+    if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer[s]"))
+       goto no_buffer_attrib;
+-   if (!check_xcb_error(cookie_fence, "xcb_dri3_fence_from_fd"))
+-      goto no_buffer_attrib;
+ 
+    buffer->pixmap = pixmap;
+    buffer->own_pixmap = true;
+-   buffer->sync_fence = sync_fence;
+-   buffer->shm_fence = shm_fence;
+    buffer->width = width;
+    buffer->height = height;
++   dri3_setup_present_wait_fence(draw, buffer);
+ 
+    /* Mark the buffer as idle
+     */
+@@ -1688,9 +1910,6 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
+ no_image:
+    free(buffer);
+ no_buffer:
+-   xshmfence_unmap_shm(shm_fence);
+-no_shm_fence:
+-   close(fence_fd);
+    return NULL;
+ }
+ 
+@@ -1955,11 +2174,8 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
+    struct loader_dri3_buffer            *buffer = draw->buffers[buf_id];
+    xcb_drawable_t                       pixmap;
+    xcb_void_cookie_t                    cookie;
+-   xcb_sync_fence_t                     sync_fence;
+-   struct xshmfence                     *shm_fence;
+    int                                  width;
+    int                                  height;
+-   int                                  fence_fd;
+    struct dri_screen                          *cur_screen;
+ 
+    if (buffer)
+@@ -1971,15 +2187,6 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
+    if (!buffer)
+       goto no_buffer;
+ 
+-   fence_fd = xshmfence_alloc_shm();
+-   if (fence_fd < 0)
+-      goto no_fence;
+-   shm_fence = xshmfence_map_shm(fence_fd);
+-   if (shm_fence == NULL) {
+-      close (fence_fd);
+-      goto no_fence;
+-   }
+-
+    /* Get the currently-bound screen or revert to using the drawable's screen if
+     * no contexts are currently bound. The latter case is at least necessary for
+     * obs-studio, when using Window Capture (Xcomposite) as a Source.
+@@ -1989,14 +2196,6 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
+        cur_screen = draw->dri_screen_render_gpu;
+    }
+ 
+-   cookie = xcb_dri3_fence_from_fd_checked(draw->conn,
+-                                           pixmap,
+-                                           (sync_fence = xcb_generate_id(draw->conn)),
+-                                           false,
+-                                           fence_fd);
+-   if (!check_xcb_error(cookie, "xcb_dri3_fence_from_fd"))
+-      goto no_image;
+-
+    buffer->image = loader_dri3_get_pixmap_buffer(draw->conn, pixmap, cur_screen, fourcc,
+                                                  draw->multiplanes_available, &width, &height, buffer);
+ 
+@@ -2007,17 +2206,12 @@ dri3_get_pixmap_buffer(struct dri_drawable *driDrawable, unsigned int fourcc,
+    buffer->own_pixmap = false;
+    buffer->width = width;
+    buffer->height = height;
+-   buffer->shm_fence = shm_fence;
+-   buffer->sync_fence = sync_fence;
+ 
+    dri3_set_render_buffer(draw, buf_id, buffer);
+ 
+    return buffer;
+ 
+ no_image:
+-   xcb_sync_destroy_fence(draw->conn, sync_fence);
+-   xshmfence_unmap_shm(shm_fence);
+-no_fence:
+    free(buffer);
+ no_buffer:
+    return NULL;
+diff --git a/src/gallium/frontends/dri/loader_dri3_helper.h b/src/gallium/frontends/dri/loader_dri3_helper.h
+index 26f138d1b831..8edad0b6e520 100644
+--- a/src/gallium/frontends/dri/loader_dri3_helper.h
++++ b/src/gallium/frontends/dri/loader_dri3_helper.h
+@@ -34,6 +34,7 @@
+ #include <GL/gl.h>
+ #include "mesa_interface.h"
+ #include "util/macros.h"
++#include "util/u_queue.h"
+ #include <c11/threads.h>
+ 
+ enum loader_dri3_buffer_type {
+@@ -65,6 +66,9 @@ struct loader_dri3_buffer {
+     */
+ 
+    uint32_t     sync_fence;     /* XID of X SyncFence object */
++   uint32_t     present_wait_fence; /* GPU completion fence for Present */
++   int          present_wait_fence_triggered;
++   struct util_queue_fence present_wait_job;
+    struct xshmfence *shm_fence; /* pointer to xshmfence object */
+    bool         busy;           /* Set on swap, cleared on IdleNotify */
+    bool         own_pixmap;     /* We allocated the pixmap ID, free on destroy */
+@@ -95,6 +99,7 @@ loader_dri3_pixmap_buf_id(enum loader_dri3_buffer_type buffer_type)
+ }
+ 
+ struct loader_dri3_drawable;
++struct loader_dri3_present_sync;
+ 
+ struct loader_dri3_vtable {
+    void (*set_drawable_size)(struct loader_dri3_drawable *, int, int);
+@@ -102,6 +107,8 @@ struct loader_dri3_vtable {
+    struct dri_context *(*get_dri_context)(struct loader_dri3_drawable *);
+    struct dri_screen *(*get_dri_screen)(void);
+    void (*flush_drawable)(struct loader_dri3_drawable *, unsigned);
++   int (*flush_drawable_with_fence_fd)(struct loader_dri3_drawable *,
++                                       unsigned);
+ };
+ 
+ #define LOADER_DRI3_NUM_BUFFERS (1 + LOADER_DRI3_MAX_BACK)
+@@ -168,8 +175,11 @@ struct loader_dri3_drawable {
+    bool adaptive_sync_active;
+    bool block_on_depleted_buffers;
+    bool queries_buffer_age;
++   bool present_sync_checked;
+    int swap_interval;
+ 
++   struct loader_dri3_present_sync *present_sync;
++
+    const struct loader_dri3_vtable *vtable;
+ 
+    unsigned int back_format;
+@@ -231,6 +241,11 @@ loader_dri3_flush(struct loader_dri3_drawable *draw,
+                   unsigned flags,
+                   enum __DRI2throttleReason throttle_reason);
+ 
++PUBLIC int
++loader_dri3_flush_with_fence_fd(struct loader_dri3_drawable *draw,
++                                unsigned flags,
++                                enum __DRI2throttleReason throttle_reason);
++
+ PUBLIC void
+ loader_dri3_copy_sub_buffer(struct loader_dri3_drawable *draw,
+                             int x, int y,
+diff --git a/src/gallium/include/pipe/p_defines.h b/src/gallium/include/pipe/p_defines.h
+index 85e4e9f7539f..574e5644ea93 100644
+--- a/src/gallium/include/pipe/p_defines.h
++++ b/src/gallium/include/pipe/p_defines.h
+@@ -1263,6 +1263,17 @@ enum pipe_context_param
+     */
+    PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+ 
++   /* The next flush is used as an explicit presentation fence.  Drivers may
++    * use this to avoid implicit-sync fallbacks while the frontend requests a
++    * native fence from the same submission.
++    */
++   PIPE_CONTEXT_PARAM_EXPLICIT_PRESENT_FENCE,
++
++   /* Compatibility policy for window-system presentation. Disable only the
++    * driver's additional CPU completion wait, not submission or API fences.
++    */
++   PIPE_CONTEXT_PARAM_DISABLE_PRESENT_WAIT_FENCE,
++
+    /* The minification/magnification switch-over point, the constant c of the
+     * GL and ES specs. Value 1 selects c = 0.5, value 0 selects c = 0.
+     *
+diff --git a/src/gallium/targets/dri/dri.sym.in b/src/gallium/targets/dri/dri.sym.in
+index f2ea9f564ff6..25f4f22e89d9 100644
+--- a/src/gallium/targets/dri/dri.sym.in
++++ b/src/gallium/targets/dri/dri.sym.in
+@@ -27,6 +27,7 @@
+ 		dri_query_renderer_string;
+ 		dri_query_renderer_integer;
+ 		dri_flush_drawable;
++		dri_disable_present_wait_fence;
+ 		dri_flush;
+ 		dri_invalidate_drawable;
+ 		dri2GalliumConfigQuery*;
+diff --git a/src/glx/dri3_glx.c b/src/glx/dri3_glx.c
+index 1ffd915990e1..5f51a044ec70 100644
+--- a/src/glx/dri3_glx.c
++++ b/src/glx/dri3_glx.c
+@@ -132,12 +132,21 @@ glx_dri3_flush_drawable(struct loader_dri3_drawable *draw, unsigned flags)
+    loader_dri3_flush(draw, flags, __DRI2_THROTTLE_SWAPBUFFER);
+ }
+ 
++static int
++glx_dri3_flush_drawable_with_fence_fd(struct loader_dri3_drawable *draw,
++                                      unsigned flags)
++{
++   return loader_dri3_flush_with_fence_fd(draw, flags,
++                                          __DRI2_THROTTLE_SWAPBUFFER);
++}
++
+ static const struct loader_dri3_vtable glx_dri3_vtable = {
+    .set_drawable_size = glx_dri3_set_drawable_size,
+    .in_current_context = glx_dri3_in_current_context,
+    .get_dri_context = glx_dri3_get_dri_context,
+    .get_dri_screen = glx_dri3_get_dri_screen,
+    .flush_drawable = glx_dri3_flush_drawable,
++   .flush_drawable_with_fence_fd = glx_dri3_flush_drawable_with_fence_fd,
+ };
+ 
+ 
+diff --git a/src/glx/glxext.c b/src/glx/glxext.c
+index fcadbfdab6a3..864343e9fb7a 100644
+--- a/src/glx/glxext.c
++++ b/src/glx/glxext.c
+@@ -17,6 +17,7 @@
+ #include <assert.h>
+ #include <stdbool.h>
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #include "glxclient.h"
+ #include <X11/extensions/Xext.h>
+@@ -990,6 +991,11 @@ __glXInitialize(Display * dpy)
+ 
+    enum glx_driver glx_driver = 0;
+    const char *env = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
++   const char *termux_backend = os_get_option("TERMUX_VA_GPU_BACKEND");
++   const bool termux_kgsl = termux_backend &&
++                            !strcmp(termux_backend, "kgsl");
++   if (!env && termux_kgsl && setenv("MESA_LOADER_DRIVER_OVERRIDE", "kgsl", 0) == 0)
++      env = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
+ 
+ #if defined(GLX_DIRECT_RENDERING)
+    Bool glx_direct = !debug_get_bool_option("LIBGL_ALWAYS_INDIRECT", false);
+@@ -1080,7 +1086,8 @@ __glXInitialize(Display * dpy)
+ #endif
+ #endif /* GLX_DIRECT_RENDERING */
+ 
+-   if (!AllocAndFetchScreenConfigs(dpy, dpyPriv, glx_driver, !env)) {
++   if (!AllocAndFetchScreenConfigs(dpy, dpyPriv, glx_driver,
++                                   !env && !termux_kgsl)) {
+       Bool fail = True;
+ #if defined(GLX_DIRECT_RENDERING)
+       if (glx_driver & GLX_DRIVER_ZINK_INFER) {
+diff --git a/src/loader/loader.c b/src/loader/loader.c
+index afad3b5465f2..a7e96f0ff973 100644
+--- a/src/loader/loader.c
++++ b/src/loader/loader.c
+@@ -726,6 +726,12 @@ loader_get_linux_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
+ bool
+ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
+ {
++#ifdef __TERMUX__
++   const char *env = getenv("MESA_LOADER_DRIVER_OVERRIDE");
++   if (env && strcmp(env, "kgsl") == 0) {
++      return false;
++   }
++#endif
+ #ifdef __linux__
+    /* Implementation without causing full enumeration of DRM devices. */
+    if (loader_get_linux_pci_id_for_fd(fd, vendor_id, chip_id))
+@@ -790,6 +796,22 @@ loader_get_driver_for_fd(int fd)
+       const char *override = os_get_option("MESA_LOADER_DRIVER_OVERRIDE");
+       if (override && strlen(override))
+          return strdup(override);
++
++      /* A PRoot Android container can expose KGSL without a DRM node.  The
++       * explicit bridge backend is the equivalent of
++       * MESA_LOADER_DRIVER_OVERRIDE=kgsl for that device, but keep the
++       * selection limited to an actual KGSL descriptor so unrelated DRM
++       * fds are still inferred normally. */
++      const char *backend = os_get_option("TERMUX_VA_GPU_BACKEND");
++      if (backend && !strcmp(backend, "kgsl")) {
++#ifdef __linux__
++         struct stat fd_stat, kgsl_stat;
++         if (fstat(fd, &fd_stat) == 0 &&
++             stat("/dev/kgsl-3d0", &kgsl_stat) == 0 &&
++             fd_stat.st_rdev == kgsl_stat.st_rdev)
++            return strdup("kgsl");
++#endif
++      }
+    }
+ 
+ #if defined(USE_DRICONF)
+diff --git a/src/util/os_file.c b/src/util/os_file.c
+index 7d99383e8b75..d3d3fb01580d 100644
+--- a/src/util/os_file.c
++++ b/src/util/os_file.c
+@@ -232,6 +232,10 @@ typedef void *kvaddr_t;
+ 
+ #endif /* DETECT_OS_DRAGONFLY || DETECT_OS_FREEBSD */
+ 
++#ifdef __TERMUX__
++#undef SYS_kcmp
++#endif
++
+ int
+ os_same_file_description(int fd1, int fd2)
+ {
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index fef8aeef8bfc..926220b6a935 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -137,6 +137,11 @@ struct wsi_device {
+        * games that cannot handle SUBOPTIMAL correctly. */
+       bool ignore_suboptimal;
+ 
++      /* Wait for an image's rendering before presenting it, in every
++       * present mode. For drivers that put no fence on the dma-buf (kgsl).
++       */
++      bool wait_for_fences;
++
+       /* Select and read Present events on a separate connection to the X
+        * server, so the WSI never reads from the application's connection. */
+       bool dedicated_event_connection;
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index 31f6e1a7b40f..4846466b0c51 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -81,6 +81,9 @@
+ #ifndef XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR
+ #define XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR 8
+ #endif
++#ifndef XCB_VALUE
++#define XCB_VALUE 2
++#endif
+ 
+ #define MAX_DAMAGE_RECTS 64
+ 
+@@ -1301,6 +1304,11 @@ struct x11_swapchain {
+    bool                                         has_async_may_tear;
+    bool                                         msc_estimate_is_stable;
+ 
++   /* Some X servers reject DRI3FenceFromFD for imported pixmaps.  Fall back
++    * to Present IdleNotify for implicit-sync image reuse when that happens.
++    */
++   bool                                         disable_shm_fences;
++
+    xcb_connection_t *                           conn;
+    /* Connection Present events are selected and read on: our own connection
+     * when we could open one, so the event thread never reads from the
+@@ -1838,7 +1846,8 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
+        !wsi_device->x11.ignore_suboptimal)
+       options |= XCB_PRESENT_OPTION_SUBOPTIMAL;
+ 
+-   xshmfence_reset(image->shm_fence);
++   if (image->shm_fence)
++      xshmfence_reset(image->shm_fence);
+ 
+    if (!chain->base.image_info.explicit_sync) {
+       ++chain->sent_image_count;
+@@ -2587,8 +2596,12 @@ x11_manage_present_queue(void *state)
+       VkPresentModeKHR present_mode = chain->images[image_index].present_mode;
+ 
+       /* Not necessary to block when we have explicit sync */
++      /* x11.wait_for_fences: no fence on the dma-buf, so the X server cannot
++       * wait and we do, in every present mode. Checked here and not in
++       * x11_needs_wait_for_fences(), which also decides the image count. */
+       bool need_fence_wait =
+-            x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
++            (chain->base.wsi->x11.wait_for_fences ||
++             x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode)) &&
+             !chain->base.image_info.explicit_sync;
+ 
+       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
+@@ -2700,7 +2713,7 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+    xcb_void_cookie_t cookie;
+    xcb_generic_error_t *error = NULL;
+    uint32_t bpp = 32;
+-   int fence_fd;
++   int fence_fd = -1;
+    image->update_region = xcb_generate_id(chain->conn);
+    xcb_xfixes_create_region(chain->conn, image->update_region, 0, NULL);
+ 
+@@ -2736,7 +2749,8 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+             for (int j = 0; j < i; j++)
+                close(fds[j]);
+ 
+-            return VK_ERROR_OUT_OF_HOST_MEMORY;
++            result = VK_ERROR_OUT_OF_HOST_MEMORY;
++            goto fail_image;
+          }
+       }
+ 
+@@ -2764,8 +2778,10 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+ 
+       /* XCB will take ownership of the FD we pass it. */
+       int fd = os_dupfd_cloexec(image->base.dma_buf_fd);
+-      if (fd == -1)
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      if (fd == -1) {
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto fail_image;
++      }
+ 
+       cookie =
+          xcb_dri3_pixmap_from_buffer_checked(chain->conn,
+@@ -2806,6 +2822,12 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+ #endif
+ 
+ out_fence:
++   if (chain->disable_shm_fences && !chain->base.image_info.explicit_sync) {
++      image->shm_fence = NULL;
++      image->sync_fence = XCB_NONE;
++      return VK_SUCCESS;
++   }
++
+    fence_fd = xshmfence_alloc_shm();
+    if (fence_fd < 0)
+       goto fail_pixmap;
+@@ -2815,17 +2837,38 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+       goto fail_shmfence_alloc;
+ 
+    image->sync_fence = xcb_generate_id(chain->conn);
+-   xcb_dri3_fence_from_fd(chain->conn,
+-                          image->pixmap,
+-                          image->sync_fence,
+-                          false,
+-                          fence_fd);
++   cookie = xcb_dri3_fence_from_fd_checked(chain->conn,
++                                           image->pixmap,
++                                           image->sync_fence,
++                                           false,
++                                           fence_fd);
++   fence_fd = -1;
++   error = xcb_request_check(chain->conn, cookie);
++   if (error != NULL) {
++      const uint8_t error_code = error->error_code;
++      free(error);
++
++      if (error_code == XCB_VALUE && !chain->base.image_info.explicit_sync) {
++         chain->disable_shm_fences = true;
++         image->sync_fence = XCB_NONE;
++         xshmfence_unmap_shm(image->shm_fence);
++         image->shm_fence = NULL;
++         return VK_SUCCESS;
++      }
++
++      goto fail_shmfence_map;
++   }
+ 
+    xshmfence_trigger(image->shm_fence);
+    return VK_SUCCESS;
+ 
++fail_shmfence_map:
++   xshmfence_unmap_shm(image->shm_fence);
++   image->shm_fence = NULL;
++
+ fail_shmfence_alloc:
+-   close(fence_fd);
++   if (fence_fd >= 0)
++      close(fence_fd);
+ 
+ fail_pixmap:
+    cookie = xcb_free_pixmap(chain->conn, image->pixmap);
+@@ -2837,7 +2880,7 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+ #else
+    UNREACHABLE("SHM support not compiled in");
+ #endif
+-   return VK_ERROR_INITIALIZATION_FAILED;
++   return result != VK_SUCCESS ? result : VK_ERROR_INITIALIZATION_FAILED;
+ }
+ 
+ static void
+@@ -2848,9 +2891,12 @@ x11_image_finish(struct x11_swapchain *chain,
+    xcb_void_cookie_t cookie;
+    if (!chain->base.wsi->sw || chain->has_mit_shm) {
+ #ifdef HAVE_X11_DRM
+-      cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
+-      xcb_discard_reply(chain->conn, cookie.sequence);
+-      xshmfence_unmap_shm(image->shm_fence);
++      if (image->sync_fence != XCB_NONE) {
++         cookie = xcb_sync_destroy_fence(chain->conn, image->sync_fence);
++         xcb_discard_reply(chain->conn, cookie.sequence);
++      }
++      if (image->shm_fence)
++         xshmfence_unmap_shm(image->shm_fence);
+ #endif
+ 
+       cookie = xcb_free_pixmap(chain->conn, image->pixmap);
+@@ -3485,7 +3531,8 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    chain->sent_image_count = 0;
+    chain->last_present_msc = 0;
+    chain->status = VK_SUCCESS;
+-   chain->has_dri3_modifiers = wsi_conn->has_dri3_modifiers;
++   chain->has_dri3_modifiers = wsi_conn->has_dri3_modifiers &&
++                                use_modifiers(wsi_device);
+    chain->has_mit_shm = wsi_conn->has_mit_shm;
+    chain->has_async_may_tear = present_caps & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR;
+    chain->has_reliable_msc = !wsi_conn->is_xwayland;
+diff --git a/src/x11/x11_dri3.c b/src/x11/x11_dri3.c
+index 3587d24d6ad6..45badc90c829 100644
+--- a/src/x11/x11_dri3.c
++++ b/src/x11/x11_dri3.c
+@@ -23,6 +23,7 @@
+ 
+ #include "x11_dri3.h"
+ 
++#include <string.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <fcntl.h>
+@@ -48,6 +49,15 @@ x11_dri3_open(xcb_connection_t *conn,
+    int                          fd;
+    const xcb_query_extension_reply_t *extension;
+ 
++   const char *env = getenv("MESA_LOADER_DRIVER_OVERRIDE");
++   const char *backend = getenv("TERMUX_VA_GPU_BACKEND");
++   if ((env && !strcmp(env, "kgsl")) ||
++       (backend && !strcmp(backend, "kgsl"))) {
++      fd = open("/dev/kgsl-3d0", O_RDWR | O_CLOEXEC);
++      if (fd >= 0)
++         return fd;
++   }
++
+    xcb_prefetch_extension_data(conn, &xcb_dri3_id);
+    extension = xcb_get_extension_data(conn, &xcb_dri3_id);
+    if (!(extension && extension->present))
