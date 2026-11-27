@@ -145,7 +145,7 @@ diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/plat
     drmDevicePtr render_dev, preferred_dev, tranche_dev;
  
     if (dri2_wl_formats_init(&dri2_dpy->formats) < 0)
-@@ -2723,8 +2727,26 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
+@@ -2723,8 +2727,27 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
     if (roundtrip(dri2_dpy) < 0)
        goto cleanup;
  
