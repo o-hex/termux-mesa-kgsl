@@ -3636,7 +3636,7 @@ index afad3b5465f2..a7e96f0ff973 100644
  bool
  loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
  {
-+#ifdef __TERMUX__
++#if defined(__TERMUX__) || defined(__ANDROID__)
 +   const char *env = getenv("MESA_LOADER_DRIVER_OVERRIDE");
 +   if (env && strcmp(env, "kgsl") == 0) {
 +      return false;
@@ -3668,21 +3668,6 @@ index afad3b5465f2..a7e96f0ff973 100644
     }
  
  #if defined(USE_DRICONF)
-diff --git a/src/util/os_file.c b/src/util/os_file.c
-index 7d99383e8b75..d3d3fb01580d 100644
---- a/src/util/os_file.c
-+++ b/src/util/os_file.c
-@@ -232,6 +232,10 @@ typedef void *kvaddr_t;
- 
- #endif /* DETECT_OS_DRAGONFLY || DETECT_OS_FREEBSD */
- 
-+#ifdef __TERMUX__
-+#undef SYS_kcmp
-+#endif
-+
- int
- os_same_file_description(int fd1, int fd2)
- {
 diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
 --- a/src/vulkan/wsi/wsi_common.h
 +++ b/src/vulkan/wsi/wsi_common.h
